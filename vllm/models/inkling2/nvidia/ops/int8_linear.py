@@ -91,6 +91,119 @@ def _int8_gemv_kernel(
 
 
 @triton.jit
+def _int8_gemv_slices_kernel(
+    X,
+    W,
+    Y,
+    M,
+    K,
+    SX,
+    SW,
+    SY,
+    x1_offset,
+    x2_offset,
+    tiles0,
+    tiles1,
+    end0,
+    end1,
+    end2,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    MP: tl.constexpr,
+):
+    """`_int8_gemv_kernel` over three consecutive row ranges of `W`
+    (`[0, end0)`, `[end0, end1)`, `[end1, end2)`), each on its own input:
+    `X`, and the rows `x1_offset` / `x2_offset` elements after it. Tiles do
+    not cross a range."""
+    pid = tl.program_id(0)
+    in1 = (pid >= tiles0) & (pid < tiles0 + tiles1)
+    in2 = pid >= tiles0 + tiles1
+    start = tl.where(in2, end1, tl.where(in1, end0, 0))
+    end = tl.where(in2, end2, tl.where(in1, end1, end0))
+    tile = pid - tl.where(in2, tiles0 + tiles1, tl.where(in1, tiles0, 0))
+    x_ptr = X + tl.where(in2, x2_offset, tl.where(in1, x1_offset, 0))
+    cols = start + tile * BN + tl.arange(0, BN)
+    rows = tl.arange(0, MP)
+    col_ok = cols < end
+    w_rows = W + cols.to(tl.int64) * SW
+    acc = tl.zeros((MP, BN), tl.float32)
+    for k0 in range(0, K, BK):
+        ks = k0 + tl.arange(0, BK)
+        w = tl.load(
+            w_rows[None, :] + ks[:, None],
+            col_ok[None, :] & (ks[:, None] < K),
+            other=0,
+        )
+        x = tl.load(
+            x_ptr + rows[:, None] * SX + ks[None, :],
+            (rows[:, None] < M) & (ks[None, :] < K),
+            other=0,
+        )
+        acc += tl.dot(x, w.to(x.dtype))
+    scale = tl.load((w_rows + K).to(tl.pointer_type(tl.float32)), col_ok, other=0.0)
+    acc = acc * scale[None, :]
+    tl.store(
+        Y + rows[:, None] * SY + cols[None, :],
+        acc.to(Y.dtype.element_ty),
+        (rows[:, None] < M) & col_ok[None, :],
+    )
+
+
+def int8_gemv_slices(
+    xs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    weight: torch.Tensor,
+    ends: tuple[int, int, int],
+) -> torch.Tensor | None:
+    """`[x0 @ W[:e0].T | x1 @ W[e0:e1].T | x2 @ W[e1:e2].T]` as one `[M, e2]`
+    tensor from a single launch, for `M <= 16` rows of bf16 `[M, K]` inputs
+    and a `pack_int8_rows` weight (None: not eligible)."""
+    x0, x1, x2 = xs
+    k = weight.shape[1] - ROW_PAD
+    m = x0.shape[0]
+    if not 0 < m <= _GEMV_MAX_M or x0.dim() != 2:
+        return None
+    for x in xs:
+        if x.shape != (m, k) or x.dtype != x0.dtype or x.stride() != x0.stride():
+            return None
+        if x.device != x0.device:
+            return None
+    size = x0.element_size()
+    offsets = [x.data_ptr() - x0.data_ptr() for x in (x1, x2)]
+    if x0.stride(1) != 1 or any(offset % size for offset in offsets):
+        return None
+    assert weight.stride(-1) == 1 and weight.stride(0) % 16 == 0
+    e0, e1, e2 = ends
+    assert 0 < e0 < e1 < e2 <= weight.shape[0]
+    out = torch.empty((m, e2), device=x0.device, dtype=x0.dtype)
+    bn = 32
+    tiles0, tiles1 = triton.cdiv(e0, bn), triton.cdiv(e1 - e0, bn)
+    bk = 512 if k % 512 == 0 else 256
+    _int8_gemv_slices_kernel[(tiles0 + tiles1 + triton.cdiv(e2 - e1, bn),)](
+        x0,
+        weight,
+        out,
+        m,
+        k,
+        x0.stride(0),
+        weight.stride(0),
+        out.stride(0),
+        offsets[0] // size,
+        offsets[1] // size,
+        tiles0,
+        tiles1,
+        e0,
+        e1,
+        e2,
+        BN=bn,
+        BK=bk,
+        MP=16,
+        num_warps=4,
+        num_stages=3 if bk == 512 else 2,
+    )
+    return out
+
+
+@triton.jit
 def _int8_gemm_kernel(
     X,
     W,

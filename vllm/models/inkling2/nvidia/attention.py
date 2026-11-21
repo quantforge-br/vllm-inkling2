@@ -51,7 +51,12 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig, KVQuan
 from ..configs import Inkling2ModelConfig
 from .lora import add_linear_lora
 from .ops import use_portable_kernels, use_sm100_kernels
-from .ops.int8_linear import int8_dense_enabled, pack_int8_rows
+from .ops.int8_linear import (
+    int8_dense_enabled,
+    int8_gemv_slices,
+    is_packed_int8,
+    pack_int8_rows,
+)
 from .ops.attention import (
     _INKLING2_FA4_REL_ATTENTION_KERNEL,
     gate_sink,
@@ -364,9 +369,18 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             return list(projected.split(self.split_sizes, dim=-1)[:6])
         q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
         k_end = q_side + kv_size
-        projected = linear(x_q, weight[: sum(self.q_side_splits)])
-        k = linear(x_k, weight[q_side:k_end])
-        v = linear(x_v, weight[k_end : k_end + kv_size])
+        fused = None
+        if is_packed_int8(weight) and self.q_side_splits[4] == 0:
+            # Decode: the three projections share one launch.
+            fused = int8_gemv_slices(
+                (x_q, x_k, x_v), weight, (q_side, k_end, k_end + kv_size)
+            )
+        if fused is not None:
+            projected, k, v = fused.split([q_side, kv_size, kv_size], dim=-1)
+        else:
+            projected = linear(x_q, weight[: sum(self.q_side_splits)])
+            k = linear(x_k, weight[q_side:k_end])
+            v = linear(x_v, weight[k_end : k_end + kv_size])
         add_linear_lora(self.qkvr, projected, x_q, range(4))
         add_linear_lora(self.qkvr, k, x_k, [4])
         add_linear_lora(self.qkvr, v, x_v, [5])
