@@ -16,6 +16,7 @@ from . import (
     use_sm100_kernels,
 )
 from .gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
+from .int4_linear import int4_linear, is_packed_int4
 from .int8_linear import int8_linear, is_packed_int8
 
 # Up to this many rows, FlashInfer's CuTe DSL low-M kernels run near HBM
@@ -30,6 +31,8 @@ def linear(
     batches over LOW_M_MAX_TOKENS only)."""
     if is_packed_int8(weight):
         return int8_linear(x, weight, out)
+    if is_packed_int4(weight):
+        return int4_linear(x, weight, out)
     if out is not None:
         assert x.shape[0] > LOW_M_MAX_TOKENS
         return torch.mm(x, weight.t(), out=out)

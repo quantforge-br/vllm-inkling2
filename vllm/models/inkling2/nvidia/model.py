@@ -79,7 +79,7 @@ from .ops import use_portable_kernels
 from .ops.gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
 from .ops.int4_linear import int4_linear, is_packed_int4, pack_int4_rows
 from .ops.int8_linear import (
-    int4_head_enabled,
+    head_bits,
     int8_dense_enabled,
     int8_linear,
     is_packed_int8,
@@ -611,11 +611,13 @@ class Inkling2ForConditionalGeneration(
             if vllm_config.lora_config is None
             else LogitsProcessor
         )
-        # Only `Inkling2LogitsProcessor` reads a packed head; the LoRA logits
-        # path and the DSpark draft (which aliases the head) need bf16.
-        self.packable_head = (
-            processor is Inkling2LogitsProcessor
-            and vllm_config.speculative_config is None
+        # Only `Inkling2LogitsProcessor` (not the LoRA logits path) and the
+        # DSpark draft, which aliases the head, read a packed head.
+        spec = vllm_config.speculative_config
+        self.packable_head = processor is Inkling2LogitsProcessor and (
+            spec is None
+            # A quantized draft copy of the head is made from the bf16 one.
+            or (spec.method == "dspark" and spec.draft_lm_head_quantization is None)
         )
         self.logits_processor = processor(
             text_config.padded_vocab_size,
@@ -798,8 +800,12 @@ class Inkling2ForConditionalGeneration(
         if int8_dense_enabled() and use_portable_kernels() and packable:
             # The 201k-row head tolerates 4 bits (ppl +0.01%) and is the one
             # GEMV where W4A16 beats W8A16 on SM86.
-            pack = pack_int4_rows if int4_head_enabled() else pack_int8_rows
-            head.weight = nn.Parameter(pack(head.weight.data), requires_grad=False)
+            bits = head_bits()
+            if bits < 16:
+                pack = pack_int4_rows if bits == 4 else pack_int8_rows
+                head.weight = nn.Parameter(
+                    pack(head.weight.data), requires_grad=False
+                )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())

@@ -47,6 +47,8 @@ from .ops.dspark import (
     rope_,
     silu_and_mul,
 )
+from .ops.int4_linear import is_packed_int4, unpack_int4_rows
+from .ops.int8_linear import is_packed_int8, unpack_int8_rows
 from .ops.linear import linear
 
 
@@ -352,11 +354,19 @@ class Inkling2MarkovHead(nn.Module):
         bias = self.hidden_out.bias.double()
         num_rows = lm_head_weight.shape[0]
         if self.fold_weight is None or self.fold_bias is None:
-            self.fold_weight = lm_head_weight.new_empty((num_rows, self.markov_rank))
-            self.fold_bias = lm_head_weight.new_empty((num_rows,))
+            # Not the head's dtype: a packed W8A16 / W4A16 head is folded
+            # from the weights it stands for.
+            dense = self.hidden_out.weight
+            self.fold_weight = dense.new_empty((num_rows, self.markov_rank))
+            self.fold_bias = dense.new_empty((num_rows,))
         for start in range(0, num_rows, 4096):
             rows = slice(start, start + 4096)
-            head = lm_head_weight[rows].double()
+            head = lm_head_weight[rows]
+            if is_packed_int4(head):
+                head = unpack_int4_rows(head, projection.shape[0])
+            elif is_packed_int8(head):
+                head = unpack_int8_rows(head)
+            head = head.double()
             self.fold_weight[rows].copy_(head @ projection)
             self.fold_bias[rows].copy_(head @ bias)
 
@@ -487,7 +497,9 @@ class Inkling2DSparkModel(nn.Module):
         """Finish sharing the target's normalized embeddings and LM head (its
         `embed_tokens` and `lm_head` are aliased by `load_dspark_model`)
         and derive the weights that depend on them."""
-        assert self.lm_head is not None and self.lm_head.weight.dtype == torch.bfloat16
+        assert self.lm_head is not None
+        weight = self.lm_head.weight
+        assert weight.dtype == torch.bfloat16 or is_packed_int8(weight) or is_packed_int4(weight)
         self.model.embed_norm = target_model.model.embed_norm
         head = self.model.markov_head
         head.rnn_bias = torch.empty_like(head.rnn_proj.bias, dtype=torch.float32)

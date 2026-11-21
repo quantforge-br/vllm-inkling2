@@ -31,10 +31,13 @@ def int8_dense_enabled() -> bool:
 
 
 @functools.cache
-def int4_head_enabled() -> bool:
-    """Whether the int8 dense mode stores the unembedding as W4A16 instead
-    (`VLLM_INKLING2_INT4_HEAD=1`; see `int4_linear`)."""
-    return os.environ.get("VLLM_INKLING2_INT4_HEAD", "0") == "1"
+def head_bits() -> int:
+    """Weight bits of the unembedding in the int8 dense mode
+    (`VLLM_INKLING2_HEAD_BITS`: 16 keeps bf16, 8 W8A16 (default), 4 W4A16,
+    see `int4_linear`)."""
+    bits = int(os.environ.get("VLLM_INKLING2_HEAD_BITS", "8"))
+    assert bits in (4, 8, 16), bits
+    return bits
 
 
 def is_packed_int8(weight: torch.Tensor) -> bool:
@@ -54,6 +57,13 @@ def pack_int8_rows(weight: torch.Tensor) -> torch.Tensor:
     packed[:, :k] = codes
     packed[:, k : k + 4] = scale.view(torch.int8)
     return packed
+
+
+def unpack_int8_rows(packed: torch.Tensor) -> torch.Tensor:
+    """The fp32 `[N, K]` weight a `pack_int8_rows` tensor stands for."""
+    k = packed.shape[1] - ROW_PAD
+    scale = packed[:, k : k + 4].contiguous().view(torch.float32)
+    return packed[:, :k].float() * scale
 
 
 @triton.jit
