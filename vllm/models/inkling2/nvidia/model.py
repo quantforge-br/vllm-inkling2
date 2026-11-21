@@ -77,7 +77,9 @@ from .ops.attention import compute_log_scaling_tau
 from .ops.attn_res import attn_res
 from .ops import use_portable_kernels
 from .ops.gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
+from .ops.int4_linear import int4_linear, is_packed_int4, pack_int4_rows
 from .ops.int8_linear import (
+    int4_head_enabled,
     int8_dense_enabled,
     int8_linear,
     is_packed_int8,
@@ -95,9 +97,10 @@ class Inkling2LogitsProcessor(LogitsProcessor):
     def _apply_head(self, lm_head, hidden_states, embedding_bias):
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
-        if is_packed_int8(lm_head.weight):
+        if is_packed_int8(lm_head.weight) or is_packed_int4(lm_head.weight):
             assert embedding_bias is None
-            return int8_linear(hidden_states, lm_head.weight, out_dtype=torch.float32)
+            head = int4_linear if is_packed_int4(lm_head.weight) else int8_linear
+            return head(hidden_states, lm_head.weight, out_dtype=torch.float32)
         from vllm.model_executor.layers.vocab_parallel_embedding import (
             UnquantizedEmbeddingMethod,
         )
@@ -608,6 +611,12 @@ class Inkling2ForConditionalGeneration(
             if vllm_config.lora_config is None
             else LogitsProcessor
         )
+        # Only `Inkling2LogitsProcessor` reads a packed head; the LoRA logits
+        # path and the DSpark draft (which aliases the head) need bf16.
+        self.packable_head = (
+            processor is Inkling2LogitsProcessor
+            and vllm_config.speculative_config is None
+        )
         self.logits_processor = processor(
             text_config.padded_vocab_size,
             org_vocab_size=text_config.vocab_size,
@@ -785,10 +794,12 @@ class Inkling2ForConditionalGeneration(
         head = self.lm_head
         embed = getattr(self.model, "embed_tokens", None)
         tied = embed is not None and getattr(embed, "weight", None) is head.weight
-        if int8_dense_enabled() and use_portable_kernels() and not tied:
-            head.weight = nn.Parameter(
-                pack_int8_rows(head.weight.data), requires_grad=False
-            )
+        packable = self.packable_head and not tied
+        if int8_dense_enabled() and use_portable_kernels() and packable:
+            # The 201k-row head tolerates 4 bits (ppl +0.01%) and is the one
+            # GEMV where W4A16 beats W8A16 on SM86.
+            pack = pack_int4_rows if int4_head_enabled() else pack_int8_rows
+            head.weight = nn.Parameter(pack(head.weight.data), requires_grad=False)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())

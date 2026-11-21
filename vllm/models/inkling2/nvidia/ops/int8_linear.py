@@ -30,6 +30,13 @@ def int8_dense_enabled() -> bool:
     return os.environ.get("VLLM_INKLING2_INT8_DENSE", "0") == "1"
 
 
+@functools.cache
+def int4_head_enabled() -> bool:
+    """Whether the int8 dense mode stores the unembedding as W4A16 instead
+    (`VLLM_INKLING2_INT4_HEAD=1`; see `int4_linear`)."""
+    return os.environ.get("VLLM_INKLING2_INT4_HEAD", "0") == "1"
+
+
 def is_packed_int8(weight: torch.Tensor) -> bool:
     return weight.dtype == torch.int8
 
