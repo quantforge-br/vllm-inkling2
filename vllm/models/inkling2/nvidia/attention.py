@@ -316,10 +316,16 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
         self.int8_kv = cache_dtype == "int8_per_token_head"
-        if self.int8_kv and vllm_config.speculative_config is not None:
+        spec = vllm_config.speculative_config
+        if self.int8_kv and spec is not None:
             # The DSpark draft keeps its KV through the stock FlashAttention
-            # cache update, which has no int8 per-token-head path.
-            raise ValueError("Inkling2 int8 KV requires speculative decoding disabled")
+            # cache update, which has no int8 per-token-head path: it needs
+            # its own bf16 cache (`kv_cache_dtype` of the speculative config).
+            if spec.kv_cache_dtype not in ("auto", "bfloat16"):
+                raise ValueError(
+                    "Inkling2 int8 KV with speculative decoding requires "
+                    "kv_cache_dtype 'bfloat16' in the speculative config"
+                )
         if cache_dtype == "float16" and vllm_config.speculative_config is not None:
             raise ValueError("Inkling2 FP16 KV requires speculative decoding disabled")
         self.kv_cache = torch.tensor([])
