@@ -26,6 +26,7 @@ from .model import (
     Inkling2ForConditionalGeneration,
     Inkling2Model,
 )
+from .ops import use_portable_kernels
 from .ops.attn_res import attn_res
 from .ops.linear import linear_k_groups
 from .ops.loop import blend_rms_norm, pair_rms_norm
@@ -121,7 +122,15 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
         broadcast over streams) and `message`, each output RMS-normalized
         with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
         pair = pair_rms_norm(dest, message)
-        hidden = torch.bmm(pair, self.controller_down[streams].transpose(1, 2))
+        down = self.controller_down[streams]
+        if len(down) > 1 and 1 < pair.shape[1] <= 16 and use_portable_kernels():
+            # A few rows (speculative verification): cuBLAS runs this batched
+            # GEMM 10x slower than one GEMM per stream on SM86.
+            hidden = pair.new_empty((*pair.shape[:2], down.shape[1]))
+            for i in range(len(down)):
+                torch.mm(pair[i], down[i].t(), out=hidden[i])
+        else:
+            hidden = torch.bmm(pair, down.transpose(1, 2))
         gain_forget = torch.bmm(
             hidden,
             self.controller_gain_forget[streams].transpose(1, 2),
