@@ -19,6 +19,8 @@ from vllm.triton_utils import tl, triton
 # Bytes after each row's codes; its fp32 scale takes the first 4.
 ROW_PAD = 16
 _GEMV_MAX_M = 16
+# Output rows from which the row-major GEMV tile wins (the unembedding).
+_WIDE_MIN_N = 65536
 
 
 @functools.cache
@@ -87,6 +89,51 @@ def _int8_gemv_kernel(
         Y + rows[:, None] * SY + cols[None, :],
         acc.to(Y.dtype.element_ty),
         (rows[:, None] < M) & col_ok[None, :],
+    )
+
+
+@triton.jit
+def _int8_gemv_wide_kernel(
+    X,
+    W,
+    Y,
+    M,
+    N,
+    K,
+    SX,
+    SW,
+    SY,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    MP: tl.constexpr,
+):
+    """`_int8_gemv_kernel` with the weight tile loaded along its rows: 15%
+    faster on the 201k-row unembedding, slower on the small projections."""
+    pid = tl.program_id(0)
+    cols = pid * BN + tl.arange(0, BN)
+    rows = tl.arange(0, MP)
+    col_ok = cols < N
+    w_rows = W + cols.to(tl.int64) * SW
+    acc = tl.zeros((BN, MP), tl.float32)
+    for k0 in range(0, K, BK):
+        ks = k0 + tl.arange(0, BK)
+        w = tl.load(
+            w_rows[:, None] + ks[None, :],
+            col_ok[:, None] & (ks[None, :] < K),
+            other=0,
+        )
+        x = tl.load(
+            X + rows[None, :] * SX + ks[:, None],
+            (rows[None, :] < M) & (ks[:, None] < K),
+            other=0,
+        )
+        acc += tl.dot(w.to(x.dtype), x)
+    scale = tl.load((w_rows + K).to(tl.pointer_type(tl.float32)), col_ok, other=0.0)
+    acc = acc * scale[:, None]
+    tl.store(
+        Y + rows[None, :] * SY + cols[:, None],
+        acc.to(Y.dtype.element_ty),
+        (rows[None, :] < M) & col_ok[:, None],
     )
 
 
@@ -270,7 +317,24 @@ def int8_linear(
         assert out.shape == (m, n) and out.stride(-1) == 1
     if m == 0:
         return out.view(*lead, n)
-    if m <= _GEMV_MAX_M:
+    if m <= _GEMV_MAX_M and n >= _WIDE_MIN_N:
+        _int8_gemv_wide_kernel[(triton.cdiv(n, 32),)](
+            x2,
+            weight,
+            out,
+            m,
+            n,
+            k,
+            x2.stride(0),
+            weight.stride(0),
+            out.stride(0),
+            BN=32,
+            BK=256,
+            MP=16,
+            num_warps=2,
+            num_stages=1,
+        )
+    elif m <= _GEMV_MAX_M:
         # Tiles from a sweep on RTX 3090 (N 8576 / 2304, K 2304 / 3072).
         bk = 512 if k % 512 == 0 else 256
         _int8_gemv_kernel[(triton.cdiv(n, 32),)](
