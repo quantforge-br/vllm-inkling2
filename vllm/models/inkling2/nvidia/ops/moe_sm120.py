@@ -10,6 +10,8 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
+from . import PDL, gdc_wait
+
 from .block_scales import _scale_offsets
 from .trtllm_bmm import ExpertPlan
 
@@ -108,7 +110,7 @@ def _mxfp8_gemm(
     BK: tl.constexpr,
 ):
     T_BLOCKS: tl.constexpr = tl.cdiv(TILE, BT)
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     pid_t = tl.program_id(1)
     tile = pid_t // T_BLOCKS
     if tile >= tl.load(Tiles + 2 * MAX_CTAS):
@@ -198,7 +200,7 @@ def bmm(
             BK=128,
             num_warps=num_warps,
             num_stages=3,
-            launch_pdl=True,
+            launch_pdl=PDL,
         )
         return out
     assert weight.dtype == torch.uint8

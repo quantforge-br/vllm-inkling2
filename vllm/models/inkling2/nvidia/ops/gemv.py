@@ -4,8 +4,9 @@
 
 import torch
 
-from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+from . import use_portable_kernels
 
 MAX_M = 16
 _BN, _BK = 32, 256
@@ -109,5 +110,5 @@ def use_sm12x_bf16_gemv(
                 and bias.stride(0) == 1
             )
         )
-        and current_platform.is_device_capability_family(120)
+        and use_portable_kernels()
     )

@@ -50,7 +50,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
 
 from ..configs import Inkling2ModelConfig
 from .lora import add_linear_lora
-from .ops import use_sm100_kernels
+from .ops import use_portable_kernels, use_sm100_kernels
 from .ops.attention import (
     _INKLING2_FA4_REL_ATTENTION_KERNEL,
     gate_sink,
@@ -293,6 +293,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         supported: tuple[str, ...] = ("auto", "bfloat16")
         if current_platform.is_device_capability_family(120):
             supported += ("float16", "fp8", "fp8_e4m3")
+        elif use_portable_kernels():
+            supported += ("float16",)
         if cache_dtype not in supported:
             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
