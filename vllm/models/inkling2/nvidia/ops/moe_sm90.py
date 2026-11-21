@@ -98,6 +98,74 @@ def _select_kernel(
         tl.store(NumPadded + tl.arange(0, 1), num_valid * ALIGN)
 
 
+# Up to this many flat rows, `_align_rows_kernel` lays the rows out.
+ALIGN_MAX_ROWS = 128
+
+
+@triton.jit
+def _align_rows_kernel(
+    Ids,
+    SortedIds,
+    BlockExperts,
+    NumPadded,
+    rows,
+    R: tl.constexpr,
+    B: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+):
+    """`moe_align_block_size` of up to `R` flat rows (`Ids`: local expert or
+    -1) for `B`-row blocks, in one program: the rows of each expert in row
+    order, padded with `rows` to whole blocks, experts in ascending order."""
+    index = tl.arange(0, R)
+    ids = tl.load(Ids + index, index < rows, other=-1)
+    valid = ids >= 0
+    same = valid[:, None] & valid[None, :] & (ids[:, None] == ids[None, :])
+    earlier = index[None, :] < index[:, None]
+    before = tl.sum((same & earlier).to(tl.int32), 1)
+    count = tl.sum(same.to(tl.int32), 1)
+    first = valid & (before == 0)
+    blocks = tl.where(first, (count + B - 1) // B, 0)
+    # Blocks of the experts below each row's expert.
+    lower = valid[:, None] & first[None, :] & (ids[None, :] < ids[:, None])
+    offset = tl.sum(tl.where(lower, blocks[None, :], 0), 1)
+    slots = tl.arange(0, R * B)
+    tl.store(SortedIds + slots, tl.full((R * B,), rows, tl.int32), slots < rows * B)
+    tl.store(BlockExperts + index, tl.full((R,), -1, tl.int32), index < rows)
+    # The padding is in place before any thread scatters its rows over it.
+    tl.debug_barrier()
+    tl.store(SortedIds + offset * B + before, index, valid)
+    for b in tl.static_range(MAX_BLOCKS):
+        tl.store(BlockExperts + offset + b, ids, first & (b < blocks))
+    tl.store(NumPadded + tl.arange(0, 1), tl.sum(blocks) * B + tl.arange(0, 1) * 0)
+
+
+def align_rows(
+    ids: torch.Tensor, block_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`moe_align_block_size(ids, block_size, ..., ignore_invalid_experts=True)`
+    for at most `ALIGN_MAX_ROWS` flat rows of local expert ids (-1: none)."""
+    tokens, topk = ids.shape
+    rows = tokens * topk
+    assert 0 < rows <= ALIGN_MAX_ROWS and block_size & (block_size - 1) == 0
+    assert ids.is_contiguous() and ids.dtype == torch.int32
+    sorted_ids = torch.empty(rows * block_size, dtype=torch.int32, device=ids.device)
+    block_experts = torch.empty(rows, dtype=torch.int32, device=ids.device)
+    num_padded = torch.empty(1, dtype=torch.int32, device=ids.device)
+    _align_rows_kernel[(1,)](
+        ids,
+        sorted_ids,
+        block_experts,
+        num_padded,
+        rows,
+        R=triton.next_power_of_2(rows),
+        B=block_size,
+        # A token routes to an expert once: at most `tokens` rows per expert.
+        MAX_BLOCKS=triton.cdiv(tokens, block_size),
+        num_warps=2,
+    )
+    return sorted_ids, block_experts, num_padded
+
+
 def select_experts(
     x: torch.Tensor,
     gate_weight: torch.Tensor,
@@ -383,6 +451,12 @@ class HummingExperts:
         if alignment is not None:
             alignments = {size: alignment for size in set(block_m.values())}
             assert len(alignments) == 1
+        elif rows <= ALIGN_MAX_ROWS and all(
+            size & (size - 1) == 0 for size in block_m.values()
+        ):
+            # A few tokens (speculative verification): one small launch
+            # instead of the two of `moe_align_block_size`.
+            alignments = {size: align_rows(ids, size) for size in set(block_m.values())}
         else:
             alignments = {
                 size: moe_align_block_size(
