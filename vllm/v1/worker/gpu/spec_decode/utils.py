@@ -49,6 +49,17 @@ class _PendingCopy:
             self.event = None
 
 
+@dataclass
+class _DraftPrefix:
+    """The leading `lens[index]` drafts of a request (`tokens` is None when
+    the scheduler only needs their number); valid once `copy` is done."""
+
+    tokens: np.ndarray | None
+    lens: np.ndarray
+    index: int
+    copy: "_PendingCopy"
+
+
 class DraftTokensHandler:
     def __init__(self, device: torch.device | None = None):
         self.device = device
@@ -72,8 +83,33 @@ class DraftTokensHandler:
         )
 
     def set_draft_tokens(
-        self, input_batch: InputBatch, draft_tokens: torch.Tensor
+        self,
+        input_batch: InputBatch,
+        draft_tokens: torch.Tensor,
+        prefix_lens: torch.Tensor | None = None,
     ) -> None:
+        """Record the drafts of `input_batch`. With `prefix_lens` (int32,
+        one per request) the scheduler is only offered that many leading
+        drafts of each request."""
+        if prefix_lens is not None:
+            # The scheduler needs the lengths on the host before it schedules
+            # the next step: copy them like the structured-output drafts.
+            copy_event = torch.Event(blocking=True)
+            current_stream = torch.accelerator.current_stream(self.device)
+            self.copy_stream.wait_stream(current_stream)
+            with stream(self.copy_stream, current_stream):
+                lens_np = async_copy_to_np(prefix_lens)
+                prefix_lens.record_stream(self.copy_stream)
+                tokens_np = None
+                if input_batch.has_structured_output_reqs:
+                    tokens_np = async_copy_to_np(draft_tokens)
+                    draft_tokens.record_stream(self.copy_stream)
+                copy_event.record()
+            copy = _PendingCopy(copy_event)
+            for i, req_id in enumerate(input_batch.req_ids):
+                row = None if tokens_np is None else tokens_np[i]
+                self._draft_tokens_by_req[req_id] = _DraftPrefix(row, lens_np, i, copy)
+            return
         if not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
             # the scheduler for this batch. Record draft token widths only.
@@ -119,6 +155,13 @@ class DraftTokensHandler:
             if isinstance(drafts, int):
                 # Construct placeholders from draft token width.
                 draft_token_ids.append([-1] * drafts)
+            elif isinstance(drafts, _DraftPrefix):
+                drafts.copy.wait()
+                num_drafts = int(drafts.lens[drafts.index])
+                if drafts.tokens is None:
+                    draft_token_ids.append([-1] * num_drafts)
+                else:
+                    draft_token_ids.append(drafts.tokens[:num_drafts].tolist())
             else:
                 ids, copy = drafts
                 copy.wait()

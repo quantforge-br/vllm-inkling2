@@ -3,6 +3,8 @@
 """DSpark speculator for the Inkling2 draft: stores the raw target features
 (each draft layer mixes them itself) and runs its recurrent Markov head."""
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -34,6 +36,20 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
         self.f_rnn = torch.zeros(
             self.max_num_reqs, config.hidden_size, dtype=self.dtype, device=device
         )
+        # Drafts are verified only while the draft's own probability of the
+        # whole prefix stays at or above this (0: verify every draft). The
+        # scheduler reads the prefix lengths, so it needs synchronous
+        # scheduling and greedy drafting.
+        self.min_prefix_confidence = float(
+            os.environ.get("VLLM_INKLING2_DSPARK_MIN_CONFIDENCE", "0")
+        )
+        self.adaptive_prefix = self.min_prefix_confidence > 0
+        self.draft_prefix_lens: torch.Tensor | None = None
+        if self.adaptive_prefix:
+            assert self.draft_logits is None, "adaptive prefix needs greedy drafting"
+            self.draft_prefix_lens = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=device
+            )
 
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
         # Draft base logits come from a bf16 GEMM, unlike the target's fp32 head.
@@ -67,11 +83,25 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
         state = hidden.new_zeros(num_reqs, self.model.config.markov_rank)
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        prefix_prob = prefix_len = None
+        if self.adaptive_prefix:
+            prefix_prob = hidden.new_ones(num_reqs, dtype=torch.float32)
+            prefix_len = torch.zeros(num_reqs, dtype=torch.int32, device=hidden.device)
         for i in range(n_spec):
             state, bias = self.model.markov_step(state, prev, context[i])
-            if self.draft_logits is None:
+            if prefix_prob is not None:
+                prev, confidence = self.model.markov_argmax_confidence(
+                    base_logits[:, i], bias
+                )
+                # The product only falls, so this counts a prefix.
+                prefix_prob = prefix_prob * confidence
+                prefix_len = prefix_len + (prefix_prob >= self.min_prefix_confidence)
+            elif self.draft_logits is None:
                 prev = self.model.markov_argmax(base_logits[:, i], bias)
             else:
                 logits = self.model.markov_logits(base_logits[:, i], bias)
                 prev = self._sample_logits(logits, idx_map[:, i], sample_pos[:, i], i)
             self.draft_tokens[:num_reqs, i] = prev
+        if prefix_len is not None:
+            assert self.draft_prefix_lens is not None
+            self.draft_prefix_lens[:num_reqs] = prefix_len

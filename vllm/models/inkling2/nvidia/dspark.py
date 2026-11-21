@@ -598,6 +598,16 @@ class Inkling2DSparkModel(nn.Module):
         """`markov_logits(...).argmax(-1)`, NaN as -inf."""
         return greedy_argmax(self.markov_logits(base_logits, bias))
 
+    def markov_argmax_confidence(
+        self, base_logits: torch.Tensor, bias: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`markov_argmax` and the draft's fp32 probability of that token."""
+        logits = self.markov_logits(base_logits, bias)
+        tokens = greedy_argmax(logits)
+        logits = logits.float()
+        top = logits.gather(1, tokens.view(-1, 1)).squeeze(1)
+        return tokens, torch.exp(top - torch.logsumexp(logits, dim=-1))
+
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
 

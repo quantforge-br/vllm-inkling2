@@ -821,8 +821,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
             self.device,
             cudagraph_mode,
-            decode_query_lens=self.vllm_config.get_decode_cudagraph_query_lens(
-                self.decode_query_len
+            decode_query_lens=(
+                # Any prefix of the drafts can be verified: one graph each.
+                {
+                    query_len: self.max_num_reqs
+                    for query_len in range(1, self.decode_query_len + 1)
+                }
+                if getattr(self.speculator, "adaptive_prefix", False)
+                else self.vllm_config.get_decode_cudagraph_query_lens(
+                    self.decode_query_len
+                )
             ),
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
@@ -2456,8 +2464,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             draft_tokens = self.req_states.draft_tokens[input_batch.idx_mapping]
+            # A speculator may ask to verify only a prefix of its drafts.
+            prefix_lens = getattr(self.speculator, "draft_prefix_lens", None)
+            if prefix_lens is not None and num_spec_tokens > 0:
+                prefix_lens = prefix_lens[: draft_tokens.shape[0]].clamp(
+                    max=num_spec_tokens
+                )
+            else:
+                prefix_lens = None
             self.draft_tokens_handler.set_draft_tokens(
-                input_batch, draft_tokens[:, :num_spec_tokens]
+                input_batch, draft_tokens[:, :num_spec_tokens], prefix_lens
             )
             # Drafts aren't used when none were proposed this step (e.g. skip_drafts).
             if self.pp_handler is not None and num_spec_tokens > 0:
