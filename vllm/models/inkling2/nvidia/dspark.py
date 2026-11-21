@@ -48,7 +48,14 @@ from .ops.dspark import (
     silu_and_mul,
 )
 from .ops.int4_linear import is_packed_int4, unpack_int4_rows
-from .ops.int8_linear import is_packed_int8, unpack_int8_rows
+from .ops import use_portable_kernels
+from .ops.int8_linear import (
+    int8_dense_enabled,
+    int8_linear,
+    is_packed_int8,
+    pack_int8_rows,
+    unpack_int8_rows,
+)
 from .ops.linear import linear
 
 
@@ -344,6 +351,8 @@ class Inkling2MarkovHead(nn.Module):
         self.dflare_norm = _RMSNorm(hidden, config.rms_norm_eps)
         self.fold_weight: torch.Tensor | None = None
         self.fold_bias: torch.Tensor | None = None
+        # W8A16 copy of `fold_weight` for the decode GEMVs (int8 dense mode).
+        self.fold_packed: torch.Tensor | None = None
         self.rnn_bias: torch.Tensor | None = None
 
     @torch.no_grad()
@@ -369,6 +378,12 @@ class Inkling2MarkovHead(nn.Module):
             head = head.double()
             self.fold_weight[rows].copy_(head @ projection)
             self.fold_bias[rows].copy_(head @ bias)
+        if int8_dense_enabled() and use_portable_kernels():
+            packed = pack_int8_rows(self.fold_weight)
+            if self.fold_packed is None:
+                self.fold_packed = packed
+            else:
+                self.fold_packed.copy_(packed)
 
     def context(self, hidden: torch.Tensor, f_rnn: torch.Tensor) -> torch.Tensor:
         """fp32 `rnn_proj` bias plus its `[hidden, f_rnn]` term for the
@@ -392,6 +407,9 @@ class Inkling2MarkovHead(nn.Module):
         weight = self.rnn_proj.weight[:, : 2 * self.markov_rank]
         raw = torch.addmm(context, inputs, weight.T, out_dtype=torch.float32)
         state, latent = markov_gate(raw, state)
+        if self.fold_packed is not None and latent.shape[0] <= 16:
+            # One GEMV at half the bytes of the bf16 GEMM per drafted token.
+            return state, int8_linear(latent, self.fold_packed).add_(self.fold_bias)
         return state, torch.addmm(self.fold_bias, latent, self.fold_weight.T)
 
 
