@@ -20,7 +20,7 @@ from vllm.triton_utils import gl, gluon, tl, tldevice, triton
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
-from . import PDL, gdc_wait, use_sm100_kernels
+from . import PDL, gdc_wait, use_portable_kernels, use_sm100_kernels
 from .attention_sm90 import MODE_GATED, MODE_PARTIAL, rel_attention
 
 # Full-layer FA4 split estimate, fitted on GB200 over uniform and mixed
@@ -400,6 +400,10 @@ def plan_decode_attention(
         if work <= (16 if max_query_len <= 2 else 8):
             return triton.cdiv(rel_extent - 1, _FA4_BLOCK_N) + 1
         return 5 if work <= 16 else 3 if work <= 32 else 2 if work <= 64 else 1
+    if use_portable_kernels():
+        # The Triton kernel keeps one 4-warp CTA per split: two per SM hide
+        # more of the KV load latency (+5% decode at 75k tokens on SM86).
+        return max(1, 2 * num_sms // work)
     return max(num_sms // work, min(num_sms // 8, 6 * num_sms // work))
 
 
