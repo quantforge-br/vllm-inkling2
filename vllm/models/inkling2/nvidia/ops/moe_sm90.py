@@ -18,6 +18,7 @@ import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .activation import _situ
@@ -29,6 +30,11 @@ if TYPE_CHECKING:
 
 # Row block size when no Humming tuning range covers the row count.
 _DEFAULT_BLOCK_M = 64
+_SM8X_SMALL_BATCH_TUNING = {
+    "block_shape": [8, 64, 128],
+    "warp_shape": [8, 64, 64],
+    "num_ctas_per_sm": 3,
+}
 
 
 @triton.jit
@@ -355,6 +361,14 @@ class HummingExperts:
             # whose order (and so the result) changes from run to run.
             for _, _, kernel_config in tuning:
                 kernel_config["use_stream_k"] = False
+            if not current_platform.has_device_capability(90):
+                # SM8x, a few tokens (speculative verification, 16+ local
+                # rows): narrower N tiles on three CTAs per SM are 0.7% of a
+                # verify step faster than the heuristic's (8, 256, 128) on
+                # RTX 3090, with the same accumulation order.
+                for lower, _, kernel_config in tuning:
+                    if lower == 16:
+                        kernel_config.update(_SM8X_SMALL_BATCH_TUNING)
             self.configs[name] = config
             self.tensors[name] = tensors
             self.tunings[name] = tuning
