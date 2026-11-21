@@ -50,6 +50,7 @@ from .ops.dspark import (
 from .ops.int4_linear import is_packed_int4, unpack_int4_rows
 from .ops import use_portable_kernels
 from .ops.int8_linear import (
+    head_bits,
     int8_dense_enabled,
     int8_linear,
     is_packed_int8,
@@ -378,7 +379,8 @@ class Inkling2MarkovHead(nn.Module):
             head = head.double()
             self.fold_weight[rows].copy_(head @ projection)
             self.fold_bias[rows].copy_(head @ bias)
-        if int8_dense_enabled() and use_portable_kernels():
+        # With a bf16 head (`VLLM_INKLING2_HEAD_BITS=16`) the draft stays bf16 too.
+        if int8_dense_enabled() and head_bits() < 16 and use_portable_kernels():
             packed = pack_int8_rows(self.fold_weight)
             if self.fold_packed is None:
                 self.fold_packed = packed
