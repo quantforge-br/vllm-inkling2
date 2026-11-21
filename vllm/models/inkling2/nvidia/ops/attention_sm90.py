@@ -158,15 +158,32 @@ def _rel_attention_kernel(
         kv_ptrs = (
             page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
         )
-        if K.dtype.element_ty.primitive_bitwidth == 8:
-            k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D).T
-        else:
+        if K.dtype.element_ty == tl.int8:
+            # int8 per-token-head rows `[K(D) | V(D) | K scale | V scale]`
+            # (8-byte aligned): exact integer codes in bf16/fp16, each key's
+            # fp32 scale applied to its score column.
+            kv_ptrs = tl.multiple_of(kv_ptrs, 8)
             k = tl.load(
                 K + kv_ptrs[None, :] + offs_d[:, None],
                 mask=key_valid[None, :],
-                other=0.0,
+                other=0,
             ).to(q.dtype)
-        s = tl.dot(q, k) * qk_scale
+            k_scale = tl.load(
+                (K + kv_ptrs + 2 * D).to(tl.pointer_type(tl.float32)),
+                mask=key_valid,
+                other=0.0,
+            )
+            s = tl.dot(q, k) * (k_scale * qk_scale)[None, :]
+        else:
+            if K.dtype.element_ty.primitive_bitwidth == 8:
+                k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D).T
+            else:
+                k = tl.load(
+                    K + kv_ptrs[None, :] + offs_d[:, None],
+                    mask=key_valid[None, :],
+                    other=0.0,
+                ).to(q.dtype)
+            s = tl.dot(q, k) * qk_scale
         dist = pos[:, None] - keys[None, :]
         visible = (dist >= 0) & key_valid[None, :]
         if WINDOW > 0:
@@ -181,15 +198,30 @@ def _rel_attention_kernel(
         alpha = tl.exp2(m_i - m_safe)
         p = tl.exp2(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        if V.dtype.element_ty.primitive_bitwidth == 8:
-            v = _load_fp8_kv(V, kv_ptrs, key_valid, q.dtype, D)
-        else:
+        if V.dtype.element_ty == tl.int8:
             v = tl.load(
                 V + kv_ptrs[:, None] + offs_d[None, :],
                 mask=key_valid[:, None],
-                other=0.0,
+                other=0,
             ).to(q.dtype)
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            v_scale = tl.load(
+                (V + kv_ptrs + D + 4).to(tl.pointer_type(tl.float32)),
+                mask=key_valid,
+                other=0.0,
+            )
+            # Scaling P's columns dequantizes V's rows.
+            pv = p * v_scale[None, :]
+        else:
+            if V.dtype.element_ty.primitive_bitwidth == 8:
+                v = _load_fp8_kv(V, kv_ptrs, key_valid, q.dtype, D)
+            else:
+                v = tl.load(
+                    V + kv_ptrs[:, None] + offs_d[None, :],
+                    mask=key_valid[:, None],
+                    other=0.0,
+                ).to(q.dtype)
+            pv = p
+        acc = acc * alpha[:, None] + tl.dot(pv.to(v.dtype), v)
         m_i = m_new
 
     empty = l_i == 0.0

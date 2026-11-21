@@ -805,14 +805,35 @@ def _kv_conv_tile(
         cache = key_cache_ptr
     kv_slot = tl.load(kv_slot_ptr + toff, mask=t_mask, other=-1)
     safe = tl.maximum(kv_slot, 0)
-    dst = (
-        cache
-        + (safe // kv_block_size)[:, None] * stride_kv_blk
-        + (safe % kv_block_size)[:, None] * stride_kv_n
+    row_off = (
+        (safe // kv_block_size) * stride_kv_blk
+        + (safe % kv_block_size) * stride_kv_n
         + head * stride_kv_h
-        + d_idx[None, :]
     )
-    tl.store(dst, y.to(cache.dtype.element_ty), mask=(kv_slot >= 0)[:, None])
+    stored = kv_slot >= 0
+    if cache.dtype.element_ty == tl.int8:
+        # int8 per-token-head rows `[K(D) | V(D) | K scale | V scale]`:
+        # symmetric codes, then the fp32 scale `2 * D` (K) or `D + 4` (V)
+        # bytes after the codes. Rows are 8-byte aligned.
+        row = cache + tl.multiple_of(row_off, 8)
+        amax = tl.max(tl.abs(y), axis=1)
+        kv_scale = tl.where(amax > 0, amax / 127.0, 1.0)
+        codes = y / kv_scale[:, None]
+        codes = tl.where(codes >= 0, codes + 0.5, codes - 0.5)
+        codes = tl.minimum(tl.maximum(codes, -127.0), 127.0)
+        tl.store(
+            row[:, None] + d_idx[None, :], codes.to(tl.int8), mask=stored[:, None]
+        )
+        scale_off = tl.where(is_v, D + 4, 2 * D)
+        tl.store(
+            (row + scale_off).to(tl.pointer_type(tl.float32)), kv_scale, mask=stored
+        )
+    else:
+        tl.store(
+            cache + row_off[:, None] + d_idx[None, :],
+            y.to(cache.dtype.element_ty),
+            mask=stored[:, None],
+        )
 
 
 # From this many tokens, q/r run in their own launch (8 tokens per program)

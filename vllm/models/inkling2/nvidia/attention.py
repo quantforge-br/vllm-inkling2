@@ -46,7 +46,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     SlidingWindowManager,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig, KVQuantMode
 
 from ..configs import Inkling2ModelConfig
 from .lora import add_linear_lora
@@ -110,19 +110,30 @@ class Inkling2AttentionBackend(FlashAttentionBackend):
         return Inkling2AttentionMetadataBuilder
 
 
+# Bytes of the fp32 scale after each head's int8 K or V codes.
+_INT8_SCALE_BYTES = 4
+
+
 def _kv_cache_layer_config(
     vllm_config: VllmConfig,
     num_kv_heads: int,
     head_dim: int,
     sliding_window: int | None,
 ) -> KVCacheLayerConfig:
+    cache_dtype = vllm_config.cache_config.cache_dtype
+    int8_kv = cache_dtype == "int8_per_token_head"
     spec = AttentionSpec(
         block_size=vllm_config.cache_config.block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_dim,
-        dtype=kv_cache_dtype_str_to_dtype(
-            vllm_config.cache_config.cache_dtype, vllm_config.model_config
+        dtype=kv_cache_dtype_str_to_dtype(cache_dtype, vllm_config.model_config),
+        # int8 codes of K and V, then their fp32 per-token-head scales:
+        # `[K(D) | V(D) | K scale | V scale]` per (head, slot), so the codes
+        # of both stay 8-byte aligned for vector loads.
+        kv_quant_mode=(
+            KVQuantMode.INT8_PER_TOKEN_HEAD if int8_kv else KVQuantMode.NONE
         ),
+        state_content_bytes=2 * (head_dim + _INT8_SCALE_BYTES) if int8_kv else None,
     )
     if sliding_window is not None:
         return SlidingWindowManager.layer_config(spec, sliding_window=sliding_window)
@@ -294,10 +305,15 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if current_platform.is_device_capability_family(120):
             supported += ("float16", "fp8", "fp8_e4m3")
         elif use_portable_kernels():
-            supported += ("float16",)
+            supported += ("float16", "int8_per_token_head")
         if cache_dtype not in supported:
             raise ValueError(f"Inkling2 KV cache dtype must be one of {supported}")
         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
+        self.int8_kv = cache_dtype == "int8_per_token_head"
+        if self.int8_kv and vllm_config.speculative_config is not None:
+            # The DSpark draft keeps its KV through the stock FlashAttention
+            # cache update, which has no int8 per-token-head path.
+            raise ValueError("Inkling2 int8 KV requires speculative decoding disabled")
         if cache_dtype == "float16" and vllm_config.speculative_config is not None:
             raise ValueError("Inkling2 FP16 KV requires speculative decoding disabled")
         self.kv_cache = torch.tensor([])
@@ -355,7 +371,19 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if self.fp8_kv:
             # Every loop pass owns byte storage containing unit-scale E4M3 KV.
             kv_cache = kv_cache.view(torch.float8_e4m3fn)
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_dim, dim=-1)
+        if self.int8_kv:
+            # `[K | V | K scale | V scale]`: the kernels find each row's
+            # scale `2 * D` (K) or `D + 4` (V) bytes after its codes.
+            kv_cache = kv_cache.view(torch.int8).transpose(1, 2)
+            d = self.head_dim
+            assert kv_cache.shape[-1] == 2 * (d + _INT8_SCALE_BYTES)
+            assert kv_cache.stride(-2) % 8 == 0
+            key_cache = kv_cache[..., :d]
+            value_cache = kv_cache[..., d : 2 * d]
+        else:
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                self.head_dim, dim=-1
+            )
         return (
             canonicalize_singleton_dim_strides(key_cache),
             canonicalize_singleton_dim_strides(value_cache),
