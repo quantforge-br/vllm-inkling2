@@ -51,6 +51,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig, KVQuan
 from ..configs import Inkling2ModelConfig
 from .lora import add_linear_lora
 from .ops import use_portable_kernels, use_sm100_kernels
+from .ops.int8_linear import int8_dense_enabled, pack_int8_rows
 from .ops.attention import (
     _INKLING2_FA4_REL_ATTENTION_KERNEL,
     gate_sink,
@@ -326,6 +327,12 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
 
     def process_weights_after_loading(self) -> None:
         self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
+        if int8_dense_enabled() and use_portable_kernels():
+            # W8A16 projections: half the bytes of the bf16 GEMVs at decode.
+            for proj in (self.qkvr, self.wo_ud):
+                proj.weight = nn.Parameter(
+                    pack_int8_rows(proj.weight.data), requires_grad=False
+                )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return Inkling2AttentionBackend

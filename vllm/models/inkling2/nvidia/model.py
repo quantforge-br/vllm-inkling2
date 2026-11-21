@@ -75,7 +75,14 @@ from .moe_ct import PROJECTIONS, Inkling2CTExperts, Inkling2CTScheme
 from .ops.allreduce import Inkling2AllReduceWorkspace
 from .ops.attention import compute_log_scaling_tau
 from .ops.attn_res import attn_res
+from .ops import use_portable_kernels
 from .ops.gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
+from .ops.int8_linear import (
+    int8_dense_enabled,
+    int8_linear,
+    is_packed_int8,
+    pack_int8_rows,
+)
 from .ops.norm import rms_norm
 from .ops.seq_parallel import SeqParallel
 from .sconv import ATTN_STREAM, MLP_STREAM, Inkling2ShortConv, conv_metadata
@@ -87,6 +94,10 @@ class Inkling2LogitsProcessor(LogitsProcessor):
 
     def _apply_head(self, lm_head, hidden_states, embedding_bias):
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+        if is_packed_int8(lm_head.weight):
+            assert embedding_bias is None
+            return int8_linear(hidden_states, lm_head.weight, out_dtype=torch.float32)
         from vllm.model_executor.layers.vocab_parallel_embedding import (
             UnquantizedEmbeddingMethod,
         )
@@ -768,6 +779,16 @@ class Inkling2ForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def process_weights_after_loading(self) -> None:
+        # W8A16 unembedding (not when tied to the input embedding).
+        head = self.lm_head
+        embed = getattr(self.model, "embed_tokens", None)
+        tied = embed is not None and getattr(embed, "weight", None) is head.weight
+        if int8_dense_enabled() and use_portable_kernels() and not tied:
+            head.weight = nn.Parameter(
+                pack_int8_rows(head.weight.data), requires_grad=False
+            )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
