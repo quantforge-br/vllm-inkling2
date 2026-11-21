@@ -21,6 +21,7 @@ def _pair_rms_norm_kernel(
     Message,
     Out,
     stride_dest_s,
+    stride_out_s,
     T,
     eps,
     D: tl.constexpr,
@@ -34,25 +35,32 @@ def _pair_rms_norm_kernel(
     message = tl.load(Message + (s * T + t) * D + cols, mask, other=0)
     dest_rstd = rsqrt(tl.div_rn(tl.sum(dest * dest), D) + eps)
     message_rstd = rsqrt(tl.div_rn(tl.sum(message * message), D) + eps)
-    out = Out + (s * T + t) * (2 * D)
+    out = Out + s * stride_out_s + t * (2 * D)
     tl.store(out + cols, (dest * dest_rstd).to(Out.dtype.element_ty), mask)
     tl.store(out + D + cols, (message * message_rstd).to(Out.dtype.element_ty), mask)
 
 
-def pair_rms_norm(dest: torch.Tensor, message: torch.Tensor) -> torch.Tensor:
+def pair_rms_norm(
+    dest: torch.Tensor, message: torch.Tensor, min_rows: int = 0
+) -> torch.Tensor:
     """bf16 `(S, T, 2D)` `[rms(dest), rms(message)]` of fp32 `(S, T, D)`
-    inputs, weightless; `dest` may broadcast over streams (stride 0)."""
+    inputs, weightless; `dest` may broadcast over streams (stride 0). With
+    `min_rows` above T, each stream has that many rows and the extra ones
+    are left unset."""
     num_streams, num_tokens, d = message.shape
     assert dest.shape == message.shape and message.is_contiguous()
     assert dest.stride(1) == d and dest.stride(2) == 1
     assert dest.dtype == message.dtype == torch.float32
-    out = message.new_empty((num_streams, num_tokens, 2 * d), dtype=torch.bfloat16)
+    out = message.new_empty(
+        (num_streams, max(num_tokens, min_rows), 2 * d), dtype=torch.bfloat16
+    )
     if num_tokens:
         _pair_rms_norm_kernel[(num_streams, num_tokens)](
             dest,
             message,
             out,
             dest.stride(0),
+            out.stride(0),
             num_tokens,
             1e-6,
             D=d,

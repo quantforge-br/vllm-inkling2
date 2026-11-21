@@ -121,15 +121,20 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
         """The `streams` controllers on fp32 `(S, T, D)` `dest` (may
         broadcast over streams) and `message`, each output RMS-normalized
         with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
-        pair = pair_rms_norm(dest, message)
         down = self.controller_down[streams]
-        if len(down) > 1 and 1 < pair.shape[1] <= 16 and use_portable_kernels():
-            # A few rows (speculative verification): cuBLAS runs this batched
-            # GEMM 10x slower than one GEMM per stream on SM86.
+        num_tokens = message.shape[1]
+        if 1 < num_tokens <= 16 and use_portable_kernels():
+            # A few rows (speculative verification). On SM86 cuBLAS has a
+            # fast kernel for this GEMM from 8 rows of one stream only (5 us
+            # against 22 us, or 25 us batched over streams): one GEMM per
+            # stream, on at least 8 rows.
+            pair = pair_rms_norm(dest, message, min_rows=8)
             hidden = pair.new_empty((*pair.shape[:2], down.shape[1]))
             for i in range(len(down)):
                 torch.mm(pair[i], down[i].t(), out=hidden[i])
+            hidden = hidden[:, :num_tokens]
         else:
+            pair = pair_rms_norm(dest, message)
             hidden = torch.bmm(pair, down.transpose(1, 2))
         gain_forget = torch.bmm(
             hidden,
