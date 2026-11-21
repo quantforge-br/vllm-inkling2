@@ -47,9 +47,16 @@ def _select_kernel(
     GROUPS: tl.constexpr,
     TOPK: tl.constexpr,
     SORT: tl.constexpr,
+    SortedIds=None,
+    BlockExperts=None,
+    NumPadded=None,
+    ALIGN: tl.constexpr = 0,
 ):
     """Local expert ids (-1: not local), routing weights and identity
-    `src2dst` of the flat rows of one token."""
+    `src2dst` of the flat rows of one token. With `ALIGN` (a single token),
+    also the `moe_align_block_size` layout of its rows for `ALIGN`-row
+    blocks: one block per local expert in expert order, the row first and
+    the padding row `TOPK` after it."""
     token = tl.program_id(0) + tl.arange(0, 1)
     bias = _load_bias(Bias, E, E_POW2)
     ids, weights = _select_experts(
@@ -65,6 +72,30 @@ def _select_kernel(
     tl.store(Ids + rows, local)
     tl.store(Weights + rows, weights)
     tl.store(Src2Dst + rows, tl.where(local >= 0, rows, -1))
+    if ALIGN > 0:
+        valid = local >= 0
+        # Block of each row: its expert's rank among the local ones.
+        rank = tl.sum(
+            (valid[:, None, :] & (local[:, None, :] < local[:, :, None])).to(tl.int32),
+            2,
+        )
+        num_valid = tl.sum(valid.to(tl.int32), 1)
+        slots = tl.arange(0, TOPK)
+        hit = valid[:, None, :] & (rank[:, None, :] == slots[None, :, None])
+        tl.store(
+            BlockExperts + slots[None, :],
+            tl.where(
+                slots[None, :] < num_valid[:, None],
+                tl.sum(tl.where(hit, local[:, None, :], 0), 2),
+                -1,
+            ),
+        )
+        positions = tl.arange(0, TOPK * ALIGN)
+        first = valid[:, None, :] & (rank[:, None, :] * ALIGN == positions[None, :, None])
+        row = tl.sum(tl.where(first, slots[None, None, :], 0), 2)
+        is_row = tl.sum(first.to(tl.int32), 2) > 0
+        tl.store(SortedIds + positions[None, :], tl.where(is_row, row, TOPK))
+        tl.store(NumPadded + tl.arange(0, 1), num_valid * ALIGN)
 
 
 def select_experts(
@@ -75,13 +106,16 @@ def select_experts(
     route_scale: float,
     expert_bounds: torch.Tensor,
     is_padding: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    align_block: int = 0,
+) -> tuple[torch.Tensor, ...]:
     """The router and top-k of `ops.moe.route`, without its layout.
 
     Returns the local expert id of each token's slots `[T, topk]` (-1: not
     one of the local experts `expert_bounds`, or a padding token), their
     routing weights `[T * topk]` and the identity `src2dst` `[T * topk]`
-    of the local rows (-1 elsewhere).
+    of the local rows (-1 elsewhere). With `align_block` (one token; see
+    `HummingExperts.decode_align_block`), a fourth element holds the
+    `moe_align_block_size` outputs for that block size, from the same launch.
     """
     tokens = x.shape[0]
     experts = gate_weight.shape[0]
@@ -89,6 +123,14 @@ def select_experts(
     ids = torch.empty((tokens, topk), dtype=torch.int32, device=x.device)
     weights = torch.empty(tokens * topk, dtype=torch.float32, device=x.device)
     src2dst = torch.empty(tokens * topk, dtype=torch.int32, device=x.device)
+    alignment = None
+    if align_block:
+        assert tokens == 1 and align_block & (align_block - 1) == 0
+        alignment = (
+            torch.empty(topk * align_block, dtype=torch.int32, device=x.device),
+            torch.empty(topk, dtype=torch.int32, device=x.device),
+            torch.empty(1, dtype=torch.int32, device=x.device),
+        )
     _select_kernel[(tokens,)](
         partials,
         bias,
@@ -104,8 +146,14 @@ def select_experts(
         GROUPS=partials.shape[0],
         TOPK=topk,
         SORT=tokens <= 128,
+        SortedIds=alignment[0] if alignment else None,
+        BlockExperts=alignment[1] if alignment else None,
+        NumPadded=alignment[2] if alignment else None,
+        ALIGN=align_block,
         num_warps=4 if tokens <= 256 else 1,
     )
+    if alignment is not None:
+        return ids, weights, src2dst, alignment
     return ids, weights, src2dst
 
 
@@ -294,6 +342,27 @@ class HummingExperts:
             tuning_config=self.tuning_strs[name],
         )
 
+    def _block_sizes(
+        self, rows: int, num_global_experts: int
+    ) -> tuple[int, dict[str, int]]:
+        # Expected local rows, which pick the kernel configs.
+        valid_rows = -(-rows * self.num_experts // num_global_experts)
+        return valid_rows, {
+            name: self._block_m(name, valid_rows) for name in ("w13", "w2")
+        }
+
+    def decode_align_block(
+        self, tokens: int, topk: int, num_global_experts: int
+    ) -> int:
+        """The row block size `select_experts` can align a batch of `tokens`
+        for in its own launch (0: none; `moe_align_block_size` runs)."""
+        if tokens != 1:
+            return 0
+        _, block_m = self._block_sizes(tokens * topk, num_global_experts)
+        sizes = set(block_m.values())
+        size = sizes.pop()
+        return size if not sizes and size & (size - 1) == 0 else 0
+
     def __call__(
         self,
         x: torch.Tensor,
@@ -303,20 +372,24 @@ class HummingExperts:
         num_global_experts: int,
         gate_cap: float,
         up_cap: float,
+        alignment: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """bf16 `[T * topk, H]` down-projection rows of the local slots of
-        `ids` (`select_experts`); the other rows are left unset."""
+        `ids` (`select_experts`); the other rows are left unset. `alignment`
+        is that of `select_experts(align_block=decode_align_block(...))`."""
         tokens, topk = ids.shape
         rows = tokens * topk
-        # Expected local rows, which pick the kernel configs.
-        valid_rows = -(-rows * self.num_experts // num_global_experts)
-        block_m = {name: self._block_m(name, valid_rows) for name in ("w13", "w2")}
-        alignments = {
-            size: moe_align_block_size(
-                ids, size, self.num_experts, ignore_invalid_experts=True
-            )[:3]
-            for size in set(block_m.values())
-        }
+        valid_rows, block_m = self._block_sizes(rows, num_global_experts)
+        if alignment is not None:
+            alignments = {size: alignment for size in set(block_m.values())}
+            assert len(alignments) == 1
+        else:
+            alignments = {
+                size: moe_align_block_size(
+                    ids, size, self.num_experts, ignore_invalid_experts=True
+                )[:3]
+                for size in set(block_m.values())
+            }
         gate_up = self._gemm(
             "w13", x, rows, alignments[block_m["w13"]], topk, valid_rows
         )

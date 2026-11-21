@@ -357,7 +357,7 @@ class Inkling2CTExperts(nn.Module):
         """See `moe.Inkling2Experts.forward` (`routing` is from
         `ops.moe_sm90.select_experts`; `quantized` and `plan` are None)."""
         assert self.humming is not None, "process_weights_after_loading"
-        ids, gammas, src2dst = routing
+        ids, gammas, src2dst, *alignment = routing
         down = self.humming(
             x,
             ids,
@@ -366,6 +366,7 @@ class Inkling2CTExperts(nn.Module):
             self.num_experts * self.ep_size,
             self.gate_cap,
             self.up_cap,
+            alignment[0] if alignment else None,
         )
         if push is not None:
             combine_push(down, src2dst, self.topk, push)

@@ -293,7 +293,7 @@ class Inkling2Experts(nn.Module):
             down = self._gemm(activated, "w2", tiles, plan, 1)
         else:
             assert self.humming is not None, "process_weights_after_loading"
-            ids, gammas, src2dst = routing
+            ids, gammas, src2dst, *alignment = routing
             down = self.humming(
                 x,
                 ids,
@@ -302,6 +302,7 @@ class Inkling2Experts(nn.Module):
                 self.num_experts * self.ep_size,
                 self.gate_cap,
                 self.up_cap,
+                alignment[0] if alignment else None,
             )
         if push is not None:
             # Each rank's fp32 combine is rounded once to bf16.
@@ -402,6 +403,10 @@ class Inkling2MoE(nn.Module):
                 gate.route_scale,
                 experts.expert_bounds,
                 is_padding,
+                # One token: its rows are aligned for the GEMMs in the same launch.
+                experts.humming.decode_align_block(
+                    x.shape[0], gate.topk, experts.num_experts * experts.ep_size
+                ),
             )
             return experts(x, selected, None, None, reduce, push)
         assert isinstance(experts, Inkling2Experts)
