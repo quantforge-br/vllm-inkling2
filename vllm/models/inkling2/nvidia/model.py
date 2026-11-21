@@ -523,6 +523,10 @@ class Inkling2ForConditionalGeneration(
     SupportsEncoderCudaGraph,
     SupportsLoRA,
 ):
+    # The DSpark draft's `mtp.safetensors` sits next to the target weights;
+    # checkpoints without a weight index (e.g. llm-compressor exports) would
+    # otherwise load it into the target.
+    allow_patterns_overrides = ["model*.safetensors"]
     # LoRA (``lora.py``): adapters use the checkpoint's module names.
     packed_modules_mapping = PACKED_MODULES_MAPPING
     embedding_modules: dict[str, str] = {}
