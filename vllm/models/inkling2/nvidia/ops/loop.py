@@ -138,3 +138,197 @@ def blend_rms_norm(
             enable_fp_fusion=False,
         )
     return out
+
+
+# Up to this many tokens, three wide launches run a whole controller (from
+# 16 tokens the per-stream GEMMs are faster on RTX 3090).
+CONTROLLER_MAX_TOKENS = 8
+# Input columns per `_controller_down_kernel` program.
+_DOWN_SLICE = 256
+# Output columns per `_controller_blend_kernel` program.
+_BLEND_SLICE = 256
+# Tiles and warps from a sweep on RTX 3090 (1 to 8 tokens, 1 and 3 streams).
+_DOWN_WARPS = 4
+_BLEND_WARPS = 8
+
+
+@triton.jit
+def _controller_down_kernel(
+    Pair,
+    Down,
+    Partials,
+    stride_pair_s,
+    T,
+    D2: tl.constexpr,
+    R: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """fp32 partial `[R]` of `down @ pair` over one `BK`-column slice of one
+    (stream, token) row; the slices are summed in order by the blend."""
+    g = tl.program_id(0).to(tl.int64)
+    t = tl.program_id(1).to(tl.int64)
+    s = tl.program_id(2).to(tl.int64)
+    ks = g * BK + tl.arange(0, BK)
+    ranks = tl.arange(0, R)
+    first = tl.arange(0, 16) == 0
+    x = tl.load(Pair + s * stride_pair_s + t * D2 + ks)
+    x = tl.where(first[None, :], x[:, None], 0.0).to(x.dtype)
+    w = tl.load(Down + s * (R * D2) + ranks[:, None] * D2 + ks[None, :])
+    acc = tl.dot(w, x)
+    partial = tl.sum(tl.where(first[None, :], acc, 0.0), 1)
+    tl.store(Partials + ((s * T + t) * (D2 // BK) + g) * R + ranks, partial)
+
+
+@triton.jit
+def _controller_blend_kernel(
+    Dest,
+    Message,
+    Partials,
+    GainForget,
+    Mixed,
+    SumSq,
+    stride_dest_s,
+    T,
+    D: tl.constexpr,
+    R: tl.constexpr,
+    G: tl.constexpr,
+    G_POW2: tl.constexpr,
+    BN: tl.constexpr,
+):
+    """The fp32 blend of one `BN`-column slice of one (stream, token) row
+    into `Mixed`, and the slice's sum of squares into `SumSq`."""
+    c = tl.program_id(0).to(tl.int64)
+    t = tl.program_id(1).to(tl.int64)
+    s = tl.program_id(2).to(tl.int64)
+    row = s * T + t
+    ranks = tl.arange(0, R)
+    slices = tl.arange(0, G_POW2)
+    first = tl.arange(0, 16) == 0
+    partials = tl.load(
+        Partials + (row * G + slices[:, None]) * R + ranks[None, :],
+        slices[:, None] < G,
+        other=0.0,
+    )
+    # Summed in fp32, then rounded once to bf16 (as the reference's GEMM).
+    hidden = tl.sum(partials, 0)
+    hidden = tl.where(first[None, :], hidden[:, None], 0.0).to(tl.bfloat16)
+    cols = c * BN + tl.arange(0, BN)
+    # Gain rows, then the forget rows of the same columns, in one product.
+    both = tl.arange(0, 2 * BN)
+    rows = c * BN + both % BN + tl.where(both >= BN, D, 0)
+    weights = GainForget + s * (2 * D * R) + rows[:, None] * R + ranks[None, :]
+    product = tl.dot(tl.load(weights), hidden)
+    product = tl.sum(tl.where(first[None, :], product, 0.0), 1)
+    gain, forget = tl.split(tl.permute(tl.reshape(product, (2, BN)), (1, 0)))
+    gain = tldevice.tanh(gain)
+    forget = tldevice.tanh(forget)
+    dest = tl.load(Dest + s * stride_dest_s + t * D + cols)
+    message = tl.load(Message + row * D + cols)
+    x = (1.0 - forget) * dest + gain * message
+    tl.store(Mixed + row * D + cols, x)
+    tl.store(SumSq + row * (D // BN) + c + tl.arange(0, 1), tl.sum(x * x) + tl.zeros((1,), tl.float32))
+
+
+@triton.jit
+def _controller_norm_kernel(
+    Mixed,
+    SumSq,
+    NormW,
+    Out,
+    stride_w_s,
+    T,
+    norm_eps,
+    D: tl.constexpr,
+    BLOCK: tl.constexpr,
+    C: tl.constexpr,
+    C_POW2: tl.constexpr,
+):
+    s = tl.program_id(0).to(tl.int64)
+    t = tl.program_id(1).to(tl.int64)
+    row = s * T + t
+    cols = tl.arange(0, BLOCK)
+    mask = cols < D
+    chunks = tl.arange(0, C_POW2)
+    sum_sq = tl.sum(tl.load(SumSq + row * C + chunks, chunks < C, other=0.0))
+    rstd = rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
+    y = tl.load(Mixed + row * D + cols, mask, other=0) * rstd
+    y = y * tl.load(NormW + s * stride_w_s + cols, mask, other=0).to(tl.float32)
+    tl.store(Out + row * D + cols, y.to(Out.dtype.element_ty), mask)
+
+
+def controller_blend(
+    dest: torch.Tensor,
+    message: torch.Tensor,
+    down: torch.Tensor,
+    gain_forget: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+) -> torch.Tensor:
+    """`blend_rms_norm` of the controllers `down` bf16 `(S, R, 2D)` and
+    `gain_forget` bf16 `(S, 2D, R)` on fp32 `(S, T, D)` `dest` (may broadcast
+    over streams) and `message`, for a few tokens: after `pair_rms_norm`,
+    one launch per stage (down projection by column slices, blend by column
+    slices, RMSNorm by row) instead of cuBLAS GEMMs per stream."""
+    num_streams, num_tokens, d = message.shape
+    rank = down.shape[1]
+    assert down.shape == (num_streams, rank, 2 * d) and down.is_contiguous()
+    assert gain_forget.shape == (num_streams, 2 * d, rank)
+    assert gain_forget.is_contiguous()
+    assert down.dtype == gain_forget.dtype == torch.bfloat16
+    assert norm_weight.shape == (num_streams, d) and norm_weight.stride(1) == 1
+    assert d % _BLEND_SLICE == 0 and (2 * d) % _DOWN_SLICE == 0
+    assert rank >= 16 and rank & (rank - 1) == 0
+    pair = pair_rms_norm(dest, message)
+    num_slices = 2 * d // _DOWN_SLICE
+    partials = message.new_empty((num_streams, num_tokens, num_slices, rank))
+    grid = (num_slices, num_tokens, num_streams)
+    _controller_down_kernel[grid](
+        pair,
+        down,
+        partials,
+        pair.stride(0),
+        num_tokens,
+        D2=2 * d,
+        R=rank,
+        BK=_DOWN_SLICE,
+        num_warps=_DOWN_WARPS,
+        num_stages=1,
+    )
+    num_chunks = d // _BLEND_SLICE
+    mixed = torch.empty_like(message)
+    sum_sq = message.new_empty((num_streams, num_tokens, num_chunks))
+    _controller_blend_kernel[(num_chunks, num_tokens, num_streams)](
+        dest,
+        message,
+        partials,
+        gain_forget,
+        mixed,
+        sum_sq,
+        dest.stride(0),
+        num_tokens,
+        D=d,
+        R=rank,
+        G=num_slices,
+        G_POW2=triton.next_power_of_2(num_slices),
+        BN=_BLEND_SLICE,
+        num_warps=_BLEND_WARPS,
+        num_stages=1,
+        # The blend is unfused (no FMA), as the reference.
+        enable_fp_fusion=False,
+    )
+    out = message.new_empty((num_streams, num_tokens, d), dtype=torch.bfloat16)
+    _controller_norm_kernel[(num_streams, num_tokens)](
+        mixed,
+        sum_sq,
+        norm_weight,
+        out,
+        norm_weight.stride(0),
+        num_tokens,
+        norm_eps,
+        D=d,
+        BLOCK=triton.next_power_of_2(d),
+        C=num_chunks,
+        C_POW2=triton.next_power_of_2(num_chunks),
+        num_warps=8,
+    )
+    return out

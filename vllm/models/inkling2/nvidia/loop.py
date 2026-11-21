@@ -29,7 +29,12 @@ from .model import (
 from .ops import use_portable_kernels
 from .ops.attn_res import attn_res
 from .ops.linear import linear_k_groups
-from .ops.loop import blend_rms_norm, pair_rms_norm
+from .ops.loop import (
+    CONTROLLER_MAX_TOKENS,
+    blend_rms_norm,
+    controller_blend,
+    pair_rms_norm,
+)
 from .sconv import conv_metadata
 
 LOOP_STREAMS = ("attn", "k", "v", "mlp")
@@ -123,6 +128,17 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
         with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
         down = self.controller_down[streams]
         num_tokens = message.shape[1]
+        if 0 < num_tokens <= CONTROLLER_MAX_TOKENS and use_portable_kernels():
+            # Decode and speculative verification: three wide Triton launches
+            # instead of five to eight small cuBLAS and Triton kernels.
+            return controller_blend(
+                dest,
+                message,
+                down,
+                self.controller_gain_forget[streams],
+                norm_weight,
+                norm_eps,
+            )
         if 1 < num_tokens <= 16 and use_portable_kernels():
             # A few rows (speculative verification). On SM86 cuBLAS has a
             # fast kernel for this GEMM from 8 rows of one stream only (5 us
