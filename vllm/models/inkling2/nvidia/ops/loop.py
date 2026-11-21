@@ -256,6 +256,16 @@ def _controller_norm_kernel(
     tl.store(Out + row * D + cols, y.to(Out.dtype.element_ty), mask)
 
 
+def controller_blend_supported(hidden: int, rank: int) -> bool:
+    """Whether `controller_blend` covers controllers of this width and rank."""
+    return (
+        hidden % _BLEND_SLICE == 0
+        and (2 * hidden) % _DOWN_SLICE == 0
+        and rank >= 16
+        and rank & (rank - 1) == 0
+    )
+
+
 def controller_blend(
     dest: torch.Tensor,
     message: torch.Tensor,
@@ -276,8 +286,7 @@ def controller_blend(
     assert gain_forget.is_contiguous()
     assert down.dtype == gain_forget.dtype == torch.bfloat16
     assert norm_weight.shape == (num_streams, d) and norm_weight.stride(1) == 1
-    assert d % _BLEND_SLICE == 0 and (2 * d) % _DOWN_SLICE == 0
-    assert rank >= 16 and rank & (rank - 1) == 0
+    assert controller_blend_supported(d, rank)
     pair = pair_rms_norm(dest, message)
     num_slices = 2 * d // _DOWN_SLICE
     partials = message.new_empty((num_streams, num_tokens, num_slices, rank))

@@ -43,10 +43,27 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
         self.min_prefix_confidence = float(
             os.environ.get("VLLM_INKLING2_DSPARK_MIN_CONFIDENCE", "0")
         )
-        self.adaptive_prefix = self.min_prefix_confidence > 0
+        self.adaptive_prefix = self.min_prefix_confidence != 0
         self.draft_prefix_lens: torch.Tensor | None = None
         if self.adaptive_prefix:
-            assert self.draft_logits is None, "adaptive prefix needs greedy drafting"
+            if not 0 < self.min_prefix_confidence <= 1:
+                raise ValueError(
+                    "VLLM_INKLING2_DSPARK_MIN_CONFIDENCE must be in (0, 1], got "
+                    f"{self.min_prefix_confidence}"
+                )
+            if vllm_config.scheduler_config.async_scheduling:
+                # Async scheduling fixes the next step's rows with placeholders
+                # before the drafts exist.
+                raise ValueError(
+                    "VLLM_INKLING2_DSPARK_MIN_CONFIDENCE requires "
+                    "--no-async-scheduling"
+                )
+            if self.draft_logits is not None:
+                raise ValueError(
+                    "VLLM_INKLING2_DSPARK_MIN_CONFIDENCE requires greedy drafting"
+                )
+            # Only `_sample_sequential` below counts the prefix.
+            assert getattr(self, "_sharded_sequential_comm", None) is None
             self.draft_prefix_lens = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=device
             )

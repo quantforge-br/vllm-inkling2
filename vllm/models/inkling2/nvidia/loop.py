@@ -33,6 +33,7 @@ from .ops.loop import (
     CONTROLLER_MAX_TOKENS,
     blend_rms_norm,
     controller_blend,
+    controller_blend_supported,
     pair_rms_norm,
 )
 from .sconv import conv_metadata
@@ -128,7 +129,11 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
         with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
         down = self.controller_down[streams]
         num_tokens = message.shape[1]
-        if 0 < num_tokens <= CONTROLLER_MAX_TOKENS and use_portable_kernels():
+        if (
+            0 < num_tokens <= CONTROLLER_MAX_TOKENS
+            and use_portable_kernels()
+            and controller_blend_supported(message.shape[2], down.shape[1])
+        ):
             # Decode and speculative verification: three wide Triton launches
             # instead of five to eight small cuBLAS and Triton kernels.
             return controller_blend(
