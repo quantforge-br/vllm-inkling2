@@ -76,14 +76,23 @@ class InklingSconvMetadataBuilder(AttentionMetadataBuilder[InklingSconvMetadata]
         # of a device (one per KV cache group) describes the same batch, so
         # they share the buffers and the launch that fills them.
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        shared = self._shared.get(device)
+        # Not when one step holds several layouts at once (microbatches are
+        # all prepared before any runs), nor when the device-side request
+        # boundaries can differ from the host copy (adaptive verification).
+        spec = vllm_config.speculative_config
+        share = not vllm_config.parallel_config.use_ubatching and not (
+            spec is not None and spec.enable_adaptive_verification
+        )
+        shared = self._shared.get(device) if share else None
         if shared is None or shared.seq_idx.shape[0] < max_num_tokens:
             shared = _SharedSeqMetadata(
                 torch.empty(max_num_tokens, dtype=torch.int32, device=device),
                 torch.empty(max_num_tokens, dtype=torch.int32, device=device),
             )
-            self._shared[device] = shared
+            if share:
+                self._shared[device] = shared
         self.shared = shared
+        self.skip_same_layout = share
         self.seq_idx_buffer = shared.seq_idx
         self.query_start_buffer = shared.query_start
 
@@ -107,7 +116,7 @@ class InklingSconvMetadataBuilder(AttentionMetadataBuilder[InklingSconvMetadata]
             num_padded_tokens,
             common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].tolist(),
         )
-        if self.shared.layout != layout:
+        if not self.skip_same_layout or self.shared.layout != layout:
             sconv_seq_metadata(
                 common_attn_metadata.query_start_loc,
                 num_reqs,

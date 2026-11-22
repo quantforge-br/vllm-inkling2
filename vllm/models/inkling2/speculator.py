@@ -58,14 +58,28 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                     "VLLM_INKLING2_DSPARK_MIN_CONFIDENCE requires "
                     "--no-async-scheduling"
                 )
-            if self.draft_logits is not None:
+            assert vllm_config.speculative_config is not None
+            if vllm_config.speculative_config.draft_sample_method != "greedy":
+                # The confidence branch does not fill the draft logits cache
+                # that probabilistic rejection sampling reads.
                 raise ValueError(
                     "VLLM_INKLING2_DSPARK_MIN_CONFIDENCE requires greedy drafting"
                 )
-            # Only `_sample_sequential` below counts the prefix.
-            assert getattr(self, "_sharded_sequential_comm", None) is None
             self.draft_prefix_lens = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=device
+            )
+
+    def load_model(self, target_model: nn.Module) -> None:
+        super().load_model(target_model)
+        if self.adaptive_prefix and (
+            self.draft_logits is not None
+            or getattr(self, "_sharded_sequential_comm", None) is not None
+        ):
+            # Only the replicated greedy `_sample_sequential` below counts
+            # the prefix (both are settled by the base class while loading).
+            raise ValueError(
+                "VLLM_INKLING2_DSPARK_MIN_CONFIDENCE requires replicated greedy "
+                "drafting"
             )
 
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
