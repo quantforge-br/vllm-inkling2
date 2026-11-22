@@ -550,7 +550,7 @@ def short_conv(
             MAX_T=p2p.max_tokens,
             AR=True,
         )
-    _sconv_kernel[grid](
+    args = (
         x,
         cache,
         weight,
@@ -573,6 +573,8 @@ def short_conv(
         block_table.shape[1],
         cache.shape[2],
         (width + 1) ** -0.5,
+    )
+    kwargs = dict(
         W=width,
         OFF=stream_offset,
         WS=stream_width,
@@ -587,6 +589,11 @@ def short_conv(
         launch_pdl=PDL,
         **ar,
     )
+    if p2p is not None:
+        key = (grid, width, stream_offset, stream_width, num_heads,
+               residual is None, addend is None)
+        p2p.check_residency(_sconv_kernel, grid, args, kwargs, key)
+    _sconv_kernel[grid](*args, **kwargs)
     return out
 
 
