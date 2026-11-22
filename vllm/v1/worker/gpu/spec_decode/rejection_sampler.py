@@ -149,6 +149,39 @@ def gather_draft_sampled(
     return draft_sampled, pos
 
 
+@triton.jit
+def _greedy_verify_kernel(
+    sampled_ptr,
+    sampled_stride,
+    num_sampled_ptr,
+    target_ptr,
+    draft_sampled_ptr,
+    cu_num_logits_ptr,
+):
+    # Greedy verification of `_rejection_kernel` + `_insert_resampled_kernel`
+    # from one target argmax per logits row: accepted drafts, then the target
+    # argmax at the first mismatch (or the bonus row).
+    req_idx = tl.program_id(0)
+    start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
+    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1).to(tl.int64)
+    accepted_length = tl.zeros((), tl.int32)
+    verifying = tl.full((), 1, tl.int32)
+    for i in range(end_idx - start_idx - 1):
+        if verifying != 0:
+            target = tl.load(target_ptr + start_idx + i)
+            draft = tl.load(draft_sampled_ptr + start_idx + i + 1).to(tl.int64)
+            accepted = (target == draft) & (draft >= 0)
+            tl.store(sampled_ptr + req_idx * sampled_stride + i, target)
+            accepted_length += accepted.to(tl.int32)
+            verifying = accepted.to(tl.int32)
+    if verifying != 0:
+        tl.store(
+            sampled_ptr + req_idx * sampled_stride + end_idx - start_idx - 1,
+            tl.load(target_ptr + end_idx - 1),
+        )
+    tl.store(num_sampled_ptr + req_idx, accepted_length + 1)
+
+
 class RejectionSampler:
     def __init__(
         self,
@@ -428,6 +461,71 @@ class RejectionSampler:
             else None
         )
         return sampled, num_sampled, logprobs_tensors, sampling_mask_tensors
+
+    def supports_target_ids(self, input_batch: InputBatch) -> bool:
+        """Whether `verify_target_ids` matches `__call__` for this batch:
+        every request greedy, with no logits processing, logprobs or
+        verification variants."""
+        sampler = self.sampler
+        idx = input_batch.idx_mapping_np
+        return (
+            type(sampler) is Sampler
+            and self.watermark_key is None
+            and not self.use_block_verification
+            and self.fly_window_size == 0
+            and self.synthetic_conditional_rates is None
+            and not self.enable_adaptive_verification
+            and not sampler.compute_nans
+            and not sampler.return_sampling_mask
+            and sampler.trace_replay_state is None
+            and bool(np.all(sampler.sampling_states.temperature.np[idx] == 0.0))
+            and not np.any(sampler.needs_logits_processing[idx])
+            and not np.any(sampler.may_mask_logits[idx])
+            and sampler.get_logprobs_dims(idx) is None
+        )
+
+    def verify_target_ids(
+        self, target_ids: torch.Tensor, input_batch: InputBatch
+    ) -> SamplerOutput:
+        """Greedy verification from the int64 target argmax of each logits
+        row (see `supports_target_ids`)."""
+        draft_sampled, _ = gather_draft_sampled(
+            input_batch.input_ids,
+            input_batch.positions,
+            input_batch.logits_indices,
+            input_batch.expanded_idx_mapping,
+            input_batch.expanded_local_pos,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        num_reqs = input_batch.num_reqs
+        sampled = draft_sampled.new_empty(
+            num_reqs, self.num_speculative_steps + 1, dtype=torch.int64
+        )
+        num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
+        _greedy_verify_kernel[(num_reqs,)](
+            sampled,
+            sampled.stride(0),
+            num_sampled,
+            target_ids,
+            draft_sampled,
+            input_batch.cu_num_logits,
+            num_warps=1,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            sampling_mask_tensors=None,
+        )
 
     def __call__(
         self,

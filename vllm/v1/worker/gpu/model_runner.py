@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -495,6 +496,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "compute_logits_local",
                     type(self.model).__name__,
                 )
+        # Greedy verification from per-shard target argmax, for models that
+        # reduce their head shards (VLLM_SHARDED_GREEDY_VERIFY=0 disables).
+        self.sharded_greedy_verify = (
+            getattr(self, "batch_sharder", None) is None
+            and self.parallel_config.tensor_parallel_size > 1
+            and hasattr(self.model, "compute_greedy_target_ids")
+            and os.environ.get("VLLM_SHARDED_GREEDY_VERIFY", "1") == "1"
+        )
 
         # Initialize samplers. Model states may override via custom_sampler().
         config_processors = self.model_config.logits_processors or ()
@@ -1746,6 +1755,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         shard_metadata = None
         global_input_batch = input_batch
+        if (
+            self.sharded_greedy_verify
+            and grammar_output is None
+            and self.batch_sharder is None
+            and input_batch.num_reqs > 0
+            and input_batch.num_draft_tokens > 0
+            and self.rejection_sampler is not None
+            and self.speculator is not None
+            and self.speculator.draft_logits is None
+            and self.rejection_sampler.supports_target_ids(input_batch)
+        ):
+            # Greedy verification needs only the target argmax: reduce it per
+            # vocabulary shard instead of all-gathering the logits.
+            target_ids = self.model.compute_greedy_target_ids(
+                hidden_states[input_batch.logits_indices]
+            )
+            sampler_output = self.rejection_sampler.verify_target_ids(
+                target_ids, input_batch
+            )
+            return (
+                sampler_output,
+                sampler_output.num_sampled,
+                sampler_output.num_rejected,
+            )
         if self.batch_sharder is not None:
             # Shard the inputs along the batch dimension to sample in parallel
             # across TP ranks.

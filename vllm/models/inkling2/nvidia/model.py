@@ -791,6 +791,28 @@ class Inkling2ForConditionalGeneration(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def compute_greedy_target_ids(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """int64 argmax over the full vocabulary of the final logits of
+        `hidden_states`, without all-gathering them: each TP rank reduces its
+        head shard and one small all-reduce picks the first maximum."""
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            tensor_model_parallel_all_reduce,
+        )
+
+        from .ops.dspark import rank_combine, target_shard_argmax
+
+        logits = self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+        start = self.lm_head.shard_indices.org_vocab_start_index
+        packed = target_shard_argmax(
+            logits.contiguous(),
+            start,
+            self.logits_processor.org_vocab_size - start,
+            get_tensor_model_parallel_rank(),
+            self.lm_head.tp_size,
+        )
+        return rank_combine(tensor_model_parallel_all_reduce(packed))[0]
+
     def process_weights_after_loading(self) -> None:
         # W8A16 unembedding (not when tied to the input embedding).
         head = self.lm_head

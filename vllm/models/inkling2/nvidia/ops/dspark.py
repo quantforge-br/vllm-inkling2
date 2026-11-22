@@ -378,3 +378,49 @@ def rank_combine(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if rows:
         _rank_combine_kernel[(rows,)](packed, tokens, conf, rows, tp, num_warps=1)
     return tokens, conf
+
+
+@triton.jit
+def _target_argmax_partial_kernel(
+    X, VAL, IDX, SUM, stride_x, n_valid, splits, BLOCK: tl.constexpr,
+):
+    # Max and first index of one block of a row of final (soft-capped) target
+    # logits; NaN counts as -inf, as the greedy rejection kernel's block max.
+    row = tl.program_id(0).to(tl.int64)
+    sp = tl.program_id(1)
+    cols = sp * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < n_valid
+    x = tl.load(X + row * stride_x + cols, mask, other=float("-inf")).to(tl.float32)
+    x = tl.where(_is_nan(x), float("-inf"), x)
+    m = tl.max(x, axis=0)
+    first = tl.min(tl.where(mask & (x == m), cols, 2147483647), axis=0)
+    tl.store(VAL + row * splits + sp, m)
+    tl.store(IDX + row * splits + sp, first)
+    tl.store(SUM + row * splits + sp, 1.0)
+
+
+def target_shard_argmax(
+    logits: torch.Tensor, start: int, n_valid: int, rank: int, tp: int
+) -> torch.Tensor:
+    """`shard_reduce`'s PACKED [4, tp, rows] (max and global first index;
+    the logsumexp slot is meaningless) for fp32 final target logits of this
+    rank's vocabulary shard, columns at or past `n_valid` ignored."""
+    rows, n = logits.shape
+    assert logits.stride(1) == 1
+    n_valid = max(0, min(n, n_valid))
+    block = 4096
+    splits = max(1, triton.cdiv(n_valid, block))
+    val = torch.empty((rows, splits), dtype=torch.float32, device=logits.device)
+    idx = torch.empty((rows, splits), dtype=torch.int32, device=logits.device)
+    sums = torch.empty((rows, splits), dtype=torch.float32, device=logits.device)
+    packed = torch.zeros((4, tp, rows), dtype=torch.float32, device=logits.device)
+    if rows:
+        _target_argmax_partial_kernel[(rows, splits)](
+            logits, val, idx, sums, logits.stride(0), n_valid, splits, block,
+            num_warps=4,
+        )
+        _shard_reduce_finish_kernel[(rows,)](
+            val, idx, sums, packed, start, rank, rows, splits, tp,
+            triton.next_power_of_2(splits), num_warps=1,
+        )
+    return packed
