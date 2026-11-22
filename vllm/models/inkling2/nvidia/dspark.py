@@ -5,6 +5,7 @@ through a small dense transformer over DFlare-mixed target-feature K/V, then a
 recurrent (`rnn_hidden`) Markov head. Numerics follow the reference
 implementation's draft (flashinfer RMSNorms, bf16 logits)."""
 
+import os
 from collections.abc import Iterable
 from typing import cast
 
@@ -13,6 +14,7 @@ from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_gather,
@@ -41,6 +43,8 @@ from ..speculator_config import Inkling2DSparkSpeculatorConfig
 from .ops.attention import block_decode_attention, plan_decode_attention
 from .ops.dspark import (
     add_softcap,
+    rank_combine,
+    shard_reduce,
     markov_gate,
     mix_rmsnorm,
     qk_norm_rope_,
@@ -507,6 +511,12 @@ class Inkling2DSparkModel(nn.Module):
                 "to at most that"
             )
         self.config = config
+        # Reduce each rank's vocabulary shard before the exchange instead of
+        # all-gathering the full logits at every draft position.
+        self.sharded_argmax = (
+            get_tensor_model_parallel_world_size() > 1
+            and os.environ.get("VLLM_INKLING2_DSPARK_SHARDED_ARGMAX", "1") == "1"
+        )
         self.model = Inkling2DSparkDecoder(
             config, vllm_config.model_config.max_model_len, f"{prefix}model"
         )
@@ -592,16 +602,37 @@ class Inkling2DSparkModel(nn.Module):
         logits = tensor_model_parallel_all_gather(logits)
         return logits[:, : self.config.vocab_size]
 
+    def _sharded_argmax_confidence(
+        self, base_logits: torch.Tensor, bias: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`markov_argmax_confidence` without gathering the vocabulary: each
+        rank reduces its shard to (max, index, logsumexp) and one small
+        all-reduce exchanges them (ties keep the first index, as
+        `greedy_argmax`)."""
+        tp = get_tensor_model_parallel_world_size()
+        rank = get_tensor_model_parallel_rank()
+        shard = base_logits.shape[1]
+        start = rank * shard
+        packed = shard_reduce(
+            base_logits, bias, self.config.final_logit_softcapping, start,
+            self.config.vocab_size - start, rank, tp,
+        )
+        return rank_combine(tensor_model_parallel_all_reduce(packed))
+
     def markov_argmax(
         self, base_logits: torch.Tensor, bias: torch.Tensor
     ) -> torch.Tensor:
         """`markov_logits(...).argmax(-1)`, NaN as -inf."""
+        if self.sharded_argmax:
+            return self._sharded_argmax_confidence(base_logits, bias)[0]
         return greedy_argmax(self.markov_logits(base_logits, bias))
 
     def markov_argmax_confidence(
         self, base_logits: torch.Tensor, bias: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`markov_argmax` and the draft's fp32 probability of that token."""
+        if self.sharded_argmax:
+            return self._sharded_argmax_confidence(base_logits, bias)
         logits = self.markov_logits(base_logits, bias)
         tokens = greedy_argmax(logits)
         logits = logits.float()

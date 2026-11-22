@@ -252,3 +252,111 @@ def markov_gate(
     if rows:
         _markov_gate_kernel[(rows,)](raw, state, out, latent, rank)
     return out, latent
+
+
+@triton.jit
+def _shard_reduce_partial_kernel(
+    A, B, VAL, IDX, SUM, stride_a, stride_b, softcap, n_valid, splits,
+    BLOCK: tl.constexpr,
+):
+    # One block of one row of `add_softcap(a, b)`: its max, the first index
+    # of that max and the sum of exp(x - max). NaN counts as -inf.
+    row = tl.program_id(0).to(tl.int64)
+    split = tl.program_id(1)
+    cols = split * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < n_valid
+    a = tl.load(A + row * stride_a + cols, mask, other=0).to(tl.float32)
+    b = tl.load(B + row * stride_b + cols, mask, other=0).to(tl.float32)
+    x = (a + b).to(tl.bfloat16)
+    x = x / softcap
+    x = tldevice.tanh(x)
+    x = x * softcap
+    x = _round_bf16(x.to(tl.float32))
+    x = tl.where(mask & (x == x), x, float("-inf"))
+    m = tl.max(x, axis=0)
+    first = tl.min(tl.where(x == m, cols, 2147483647), axis=0)
+    s = tl.sum(tl.where(x == float("-inf"), 0.0, tl.exp(x - m)), axis=0)
+    out = row * splits + split
+    tl.store(VAL + out, m)
+    tl.store(IDX + out, first)
+    tl.store(SUM + out, s)
+
+
+@triton.jit
+def _shard_reduce_finish_kernel(
+    VAL, IDX, SUM, PACKED, start, rank, rows, splits, TP: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    # Row summary (max, global index, logsumexp) in this rank's slot of
+    # PACKED [3, TP, rows]; the other ranks' slots are zeroed for the sum.
+    row = tl.program_id(0).to(tl.int64)
+    j = tl.arange(0, SPLITS)
+    mask = j < splits
+    v = tl.load(VAL + row * splits + j, mask, other=float("-inf"))
+    i = tl.load(IDX + row * splits + j, mask, other=2147483647)
+    s = tl.load(SUM + row * splits + j, mask, other=0.0)
+    m = tl.max(v, axis=0)
+    first = tl.min(tl.where(v == m, i, 2147483647), axis=0)
+    total = tl.sum(tl.where(v == float("-inf"), 0.0, s * tl.exp(v - m)), axis=0)
+    lse = m + tl.log(total)
+    for r in tl.static_range(TP):
+        own = r == rank
+        tl.store(PACKED + r * rows + row, tl.where(own, m, 0.0))
+        tl.store(PACKED + (TP + r) * rows + row, tl.where(own, (first + start).to(tl.float32), 0.0))
+        tl.store(PACKED + (2 * TP + r) * rows + row, tl.where(own, lse, 0.0))
+
+
+@triton.jit
+def _rank_combine_kernel(PACKED, TOKENS, CONF, rows, TP: tl.constexpr):
+    # Across ranks: the first rank holding the max wins (lower vocab index).
+    row = tl.program_id(0).to(tl.int64)
+    r = tl.arange(0, TP)
+    v = tl.load(PACKED + r * rows + row)
+    i = tl.load(PACKED + (TP + r) * rows + row)
+    lse = tl.load(PACKED + (2 * TP + r) * rows + row)
+    m = tl.max(v, axis=0)
+    best = tl.min(tl.where(v == m, r, TP), axis=0)
+    token = tl.sum(tl.where(r == best, i, 0.0), axis=0)
+    lm = tl.max(lse, axis=0)
+    total_lse = lm + tl.log(tl.sum(tl.exp(lse - lm), axis=0))
+    tl.store(TOKENS + row, token.to(tl.int64))
+    tl.store(CONF + row, tl.exp(m - total_lse))
+
+
+def shard_reduce(
+    a: torch.Tensor, b: torch.Tensor, softcap: float, start: int, n_valid: int,
+    rank: int, tp: int,
+) -> torch.Tensor:
+    """PACKED [3, tp, rows] fp32 for `add_softcap(a, b)` of this rank's
+    vocabulary shard (columns at or past `n_valid` ignored): its row max,
+    global index of the first max and logsumexp in slot `rank`, zeros in the
+    other slots, ready for an all-reduce sum."""
+    rows, n = a.shape
+    assert a.stride(1) == 1 and b.stride(1) == 1
+    n_valid = max(0, min(n, n_valid))
+    block = 4096
+    splits = max(1, triton.cdiv(n_valid, block))
+    val = torch.empty((rows, splits), dtype=torch.float32, device=a.device)
+    idx = torch.empty((rows, splits), dtype=torch.int32, device=a.device)
+    sums = torch.empty((rows, splits), dtype=torch.float32, device=a.device)
+    packed = torch.empty((3, tp, rows), dtype=torch.float32, device=a.device)
+    if rows:
+        _shard_reduce_partial_kernel[(rows, splits)](
+            a, b, val, idx, sums, a.stride(0), b.stride(0), softcap, n_valid,
+            splits, block, num_warps=4,
+        )
+        _shard_reduce_finish_kernel[(rows,)](
+            val, idx, sums, packed, start, rank, rows, splits, tp,
+            triton.next_power_of_2(splits), num_warps=1,
+        )
+    return packed
+
+
+def rank_combine(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """(int64 tokens, fp32 probabilities) from an all-reduced `shard_reduce`."""
+    _, tp, rows = packed.shape
+    tokens = torch.empty(rows, dtype=torch.int64, device=packed.device)
+    conf = torch.empty(rows, dtype=torch.float32, device=packed.device)
+    if rows:
+        _rank_combine_kernel[(rows,)](packed, tokens, conf, rows, tp, num_warps=1)
+    return tokens, conf
