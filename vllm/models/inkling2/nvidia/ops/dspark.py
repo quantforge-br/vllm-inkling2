@@ -255,12 +255,20 @@ def markov_gate(
 
 
 @triton.jit
+def _is_nan(x):
+    # On the bits: the compiler may fold `x != x` to false.
+    bits = x.to(tl.uint32, bitcast=True)
+    return (bits & 0x7FFFFFFF) > 0x7F800000
+
+
+@triton.jit
 def _shard_reduce_partial_kernel(
     A, B, VAL, IDX, SUM, stride_a, stride_b, softcap, n_valid, splits,
     BLOCK: tl.constexpr,
 ):
     # One block of one row of `add_softcap(a, b)`: its max, the first index
-    # of that max and the sum of exp(x - max). NaN counts as -inf.
+    # of that max and the sum of exp(x - max). NaN counts as -inf for the
+    # max and makes the sum NaN, as torch.logsumexp does.
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(1)
     cols = split * BLOCK + tl.arange(0, BLOCK)
@@ -271,11 +279,17 @@ def _shard_reduce_partial_kernel(
     x = x / softcap
     x = tldevice.tanh(x)
     x = x * softcap
-    x = _round_bf16(x.to(tl.float32))
-    x = tl.where(mask & (x == x), x, float("-inf"))
+    x = x.to(tl.float32)
+    # Before rounding: `_round_bf16` carries a 0x7FFFFFFF NaN into the sign
+    # bit and returns -0.0.
+    nan = mask & _is_nan(x)
+    x = _round_bf16(x)
+    has_nan = tl.max(nan.to(tl.int32), axis=0)
+    x = tl.where(mask & ~nan, x, float("-inf"))
     m = tl.max(x, axis=0)
     first = tl.min(tl.where(x == m, cols, 2147483647), axis=0)
     s = tl.sum(tl.where(x == float("-inf"), 0.0, tl.exp(x - m)), axis=0)
+    s = tl.where(has_nan > 0, float("nan"), s)
     out = row * splits + split
     tl.store(VAL + out, m)
     tl.store(IDX + out, first)
@@ -288,7 +302,7 @@ def _shard_reduce_finish_kernel(
     SPLITS: tl.constexpr,
 ):
     # Row summary (max, global index, logsumexp) in this rank's slot of
-    # PACKED [3, TP, rows]; the other ranks' slots are zeroed for the sum.
+    # PACKED [4, TP, rows]; the other ranks' slots are zeroed for the sum.
     row = tl.program_id(0).to(tl.int64)
     j = tl.arange(0, SPLITS)
     mask = j < splits
@@ -298,7 +312,8 @@ def _shard_reduce_finish_kernel(
     m = tl.max(v, axis=0)
     first = tl.min(tl.where(v == m, i, 2147483647), axis=0)
     total = tl.sum(tl.where(v == float("-inf"), 0.0, s * tl.exp(v - m)), axis=0)
-    lse = m + tl.log(total)
+    has_nan = tl.max((mask & _is_nan(s)).to(tl.int32), axis=0)
+    lse = tl.where(has_nan > 0, float("nan"), m + tl.log(total))
     for r in tl.static_range(TP):
         own = r == rank
         tl.store(PACKED + r * rows + row, tl.where(own, m, 0.0))
@@ -319,15 +334,18 @@ def _rank_combine_kernel(PACKED, TOKENS, CONF, rows, TP: tl.constexpr):
     token = tl.sum(tl.where(r == best, i, 0.0), axis=0)
     lm = tl.max(lse, axis=0)
     total_lse = lm + tl.log(tl.sum(tl.exp(lse - lm), axis=0))
+    has_nan = tl.max(_is_nan(lse).to(tl.int32), axis=0)
+    conf = tl.where(has_nan > 0, float("nan"), tl.exp(m - total_lse))
     tl.store(TOKENS + row, token.to(tl.int64))
-    tl.store(CONF + row, tl.exp(m - total_lse))
+    tl.store(CONF + row, conf)
 
 
 def shard_reduce(
     a: torch.Tensor, b: torch.Tensor, softcap: float, start: int, n_valid: int,
     rank: int, tp: int,
 ) -> torch.Tensor:
-    """PACKED [3, tp, rows] fp32 for `add_softcap(a, b)` of this rank's
+    """PACKED [4, tp, rows] fp32 (the 4th slot is zero padding that keeps
+    the tensor a multiple of 16 bytes for the custom all-reduce) for `add_softcap(a, b)` of this rank's
     vocabulary shard (columns at or past `n_valid` ignored): its row max,
     global index of the first max and logsumexp in slot `rank`, zeros in the
     other slots, ready for an all-reduce sum."""
@@ -339,7 +357,7 @@ def shard_reduce(
     val = torch.empty((rows, splits), dtype=torch.float32, device=a.device)
     idx = torch.empty((rows, splits), dtype=torch.int32, device=a.device)
     sums = torch.empty((rows, splits), dtype=torch.float32, device=a.device)
-    packed = torch.empty((3, tp, rows), dtype=torch.float32, device=a.device)
+    packed = torch.zeros((4, tp, rows), dtype=torch.float32, device=a.device)
     if rows:
         _shard_reduce_partial_kernel[(rows, splits)](
             a, b, val, idx, sums, a.stride(0), b.stride(0), softcap, n_valid,
