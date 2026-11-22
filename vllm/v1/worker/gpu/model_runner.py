@@ -501,8 +501,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.sharded_greedy_verify = (
             getattr(self, "batch_sharder", None) is None
             and self.parallel_config.tensor_parallel_size > 1
-            # LoRA on lm_head needs gathered logits (skip_gather raises).
-            and self.lora_config is None
             and hasattr(self.model, "compute_greedy_target_ids")
             and os.environ.get("VLLM_SHARDED_GREEDY_VERIFY", "1") == "1"
         )
@@ -510,7 +508,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.sharded_sample_verify = (
             getattr(self, "batch_sharder", None) is None
             and self.parallel_config.tensor_parallel_size in (2, 4, 8)
-            and self.lora_config is None
             and hasattr(self.model, "compute_logits_shard")
             and os.environ.get("VLLM_SHARDED_SAMPLE_VERIFY", "1") == "1"
         )
@@ -1757,6 +1754,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _head_shards_usable(self) -> bool:
+        """Whether the model's logits can be read per TP shard: a LoRA adapter
+        on lm_head wraps the logits processor, which then needs the gathered
+        logits (its skip_gather path raises)."""
+        usable = getattr(self, "_head_shards_usable_cached", None)
+        if usable is None:
+            from vllm.lora.layers.logits_processor import LogitsProcessorWithLoRA
+
+            processor = getattr(self.model, "logits_processor", None)
+            usable = processor is not None and not isinstance(
+                processor, LogitsProcessorWithLoRA
+            )
+            self._head_shards_usable_cached = usable
+        return usable
+
     def sample(
         self,
         hidden_states: torch.Tensor,
@@ -1767,6 +1779,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         global_input_batch = input_batch
         if (
             self.sharded_greedy_verify
+            and self._head_shards_usable()
             and grammar_output is None
             and self.batch_sharder is None
             and input_batch.num_reqs > 0
@@ -1791,6 +1804,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         if (
             self.sharded_sample_verify
+            and self._head_shards_usable()
             and grammar_output is None
             and self.batch_sharder is None
             and input_batch.num_reqs > 0

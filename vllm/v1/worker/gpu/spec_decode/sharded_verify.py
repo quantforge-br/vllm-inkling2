@@ -73,10 +73,11 @@ def _shard_stats_kernel(
         USE_FP64=False,
         APPLY_TEMPERATURE=False,
     )
-    # A NaN winner wins, as in `_gumbel_combine_kernel` (torch.argmax order):
-    # +inf keeps the lowest such index across splits and ranks, while a NaN
-    # would fail every equality below and leave no valid token.
-    gv = tl.where(gv != gv, float("inf"), gv)
+    # A block of only NaN logits has a NaN winner, which would fail every
+    # equality below and leave no valid token. Rank it under every real
+    # value, as rejection_sample does (any real logit, +inf included, beats
+    # an all-NaN block), but above the -inf of empty splits.
+    gv = tl.where(gv != gv, -3.4028234663852886e38, gv)
     out = Stats + (row * splits + sp) * NUM_STATS
     tl.store(out + 0, m)
     tl.store(out + 1, s)
