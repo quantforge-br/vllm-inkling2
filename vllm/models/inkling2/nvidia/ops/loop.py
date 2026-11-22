@@ -336,6 +336,10 @@ def controller_blend(
     assert down.dtype == gain_forget.dtype == torch.bfloat16
     assert norm_weight.shape == (num_streams, d) and norm_weight.stride(1) == 1
     assert controller_blend_supported(d, rank)
+    # The kernels index both inputs as `(s * T + t) * D` rows.
+    assert dest.shape == message.shape and message.is_contiguous()
+    assert dest.stride(1) == d and dest.stride(2) == 1
+    assert dest.dtype == message.dtype == torch.float32
     num_slices = 2 * d // _DOWN_SLICE
     partials = message.new_empty((num_streams, num_tokens, num_slices, rank))
     grid = (num_slices, num_tokens, num_streams)
