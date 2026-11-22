@@ -49,8 +49,19 @@ class InklingSconvMetadata(AttentionMetadata):
     query_start: torch.Tensor  # [T] int32 first x-row of each token's request
 
 
+@dataclass
+class _SharedSeqMetadata:
+    """`seq_idx` / `query_start` buffers of a device and the batch layout
+    (padded token count, request starts) they currently hold."""
+
+    seq_idx: torch.Tensor
+    query_start: torch.Tensor
+    layout: tuple | None = None
+
+
 class InklingSconvMetadataBuilder(AttentionMetadataBuilder[InklingSconvMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    _shared: ClassVar[dict[torch.device, _SharedSeqMetadata]] = {}
 
     def __init__(
         self,
@@ -61,14 +72,20 @@ class InklingSconvMetadataBuilder(AttentionMetadataBuilder[InklingSconvMetadata]
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         assert isinstance(kv_cache_spec, AttentionSpec)
-        # Persistent per-token buffers for CUDA graph capture.
+        # Persistent per-token buffers for CUDA graph capture. Every builder
+        # of a device (one per KV cache group) describes the same batch, so
+        # they share the buffers and the launch that fills them.
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        self.seq_idx_buffer = torch.empty(
-            max_num_tokens, dtype=torch.int32, device=device
-        )
-        self.query_start_buffer = torch.empty(
-            max_num_tokens, dtype=torch.int32, device=device
-        )
+        shared = self._shared.get(device)
+        if shared is None or shared.seq_idx.shape[0] < max_num_tokens:
+            shared = _SharedSeqMetadata(
+                torch.empty(max_num_tokens, dtype=torch.int32, device=device),
+                torch.empty(max_num_tokens, dtype=torch.int32, device=device),
+            )
+            self._shared[device] = shared
+        self.shared = shared
+        self.seq_idx_buffer = shared.seq_idx
+        self.query_start_buffer = shared.query_start
 
     def build(
         self,
@@ -84,14 +101,22 @@ class InklingSconvMetadataBuilder(AttentionMetadataBuilder[InklingSconvMetadata]
         # Per-token seq_idx (owning request) and query_start (first x-row of
         # that request; the fused kernel uses it to tell same-forward taps,
         # read from x, from pre-forward taps, read from cache) in one launch.
-        sconv_seq_metadata(
-            common_attn_metadata.query_start_loc,
-            num_reqs,
-            num_actual_tokens,
-            self.seq_idx_buffer,
-            self.query_start_buffer,
+        # The buffers only depend on the batch layout: skip the launch when
+        # another builder, or an earlier step, already wrote this layout.
+        layout = (
             num_padded_tokens,
+            common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].tolist(),
         )
+        if self.shared.layout != layout:
+            sconv_seq_metadata(
+                common_attn_metadata.query_start_loc,
+                num_reqs,
+                num_actual_tokens,
+                self.seq_idx_buffer,
+                self.query_start_buffer,
+                num_padded_tokens,
+            )
+            self.shared.layout = layout
 
         return InklingSconvMetadata(
             block_table=common_attn_metadata.block_table_tensor,
