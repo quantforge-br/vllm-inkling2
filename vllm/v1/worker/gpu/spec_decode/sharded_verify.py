@@ -73,6 +73,10 @@ def _shard_stats_kernel(
         USE_FP64=False,
         APPLY_TEMPERATURE=False,
     )
+    # A NaN winner wins, as in `_gumbel_combine_kernel` (torch.argmax order):
+    # +inf keeps the lowest such index across splits and ranks, while a NaN
+    # would fail every equality below and leave no valid token.
+    gv = tl.where(gv != gv, float("inf"), gv)
     out = Stats + (row * splits + sp) * NUM_STATS
     tl.store(out + 0, m)
     tl.store(out + 1, s)
@@ -99,7 +103,7 @@ def _shard_finish_kernel(
     big_m = tl.max(m, axis=0)
     big_s = tl.where(
         big_m > float("-inf"),
-        tl.sum(tl.where(m > float("-inf"), s * tl.exp(m - big_m), 0.0), axis=0),
+        tl.sum(tl.where(m == float("-inf"), 0.0, s * tl.exp(m - big_m)), axis=0),
         0.0,
     )
     big_gv = tl.max(gv, axis=0)
@@ -150,7 +154,7 @@ def _sharded_verify_kernel(
                 s = tl.load(slot + 1 * stride)
                 big_m = tl.max(m, axis=0)
                 lse = big_m + tl.log(
-                    tl.sum(tl.where(m > float("-inf"), s * tl.exp(m - big_m), 0.0))
+                    tl.sum(tl.where(m == float("-inf"), 0.0, s * tl.exp(m - big_m)))
                 )
                 target_logprob = tl.max(tl.load(slot + 2 * stride), axis=0) - lse
                 u = tl_rand32(seed, tl.load(pos_ptr + logit_idx), includes_zero=False)

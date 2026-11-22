@@ -501,6 +501,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.sharded_greedy_verify = (
             getattr(self, "batch_sharder", None) is None
             and self.parallel_config.tensor_parallel_size > 1
+            # LoRA on lm_head needs gathered logits (skip_gather raises).
+            and self.lora_config is None
             and hasattr(self.model, "compute_greedy_target_ids")
             and os.environ.get("VLLM_SHARDED_GREEDY_VERIFY", "1") == "1"
         )
@@ -508,6 +510,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.sharded_sample_verify = (
             getattr(self, "batch_sharder", None) is None
             and self.parallel_config.tensor_parallel_size in (2, 4, 8)
+            and self.lora_config is None
             and hasattr(self.model, "compute_logits_shard")
             and os.environ.get("VLLM_SHARDED_SAMPLE_VERIFY", "1") == "1"
         )
