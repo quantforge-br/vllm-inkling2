@@ -5,6 +5,7 @@ q/k/r, gated output and per-token attention sinks."""
 
 from dataclasses import dataclass, field
 from functools import partial
+import os
 from typing import cast
 
 import numpy as np
@@ -86,6 +87,12 @@ class Inkling2AttentionMetadataBuilder(FlashAttentionMetadataBuilder):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        # Built only from the batch-level common metadata plus the group's
+        # block table and slot mapping: groups of the same KV spec share one
+        # build and swap those two (update_block_table).
+        self.share_across_groups = (
+            os.environ.get("VLLM_INKLING2_SHARE_ATTN_METADATA", "1") == "1"
+        )
 
     def build(
         self,

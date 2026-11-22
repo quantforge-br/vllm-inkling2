@@ -567,6 +567,19 @@ def build_attn_metadata(
                 attn_group.kv_cache_spec, MambaSpec
             ):
                 reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
+            elif (
+                attn_metadata_builder.supports_update_block_table
+                and getattr(attn_metadata_builder, "share_across_groups", False)
+                and isinstance(group_causal, bool)
+                and not common_attn_metadata_extra_kwargs
+            ):
+                # Groups whose metadata depends on the group only through its
+                # block table and slot mapping (opted in by the builder).
+                reuse_key = (
+                    attn_group.kv_cache_spec,
+                    type(attn_metadata_builder),
+                    group_causal,
+                )
             if reuse_key in cached_metadata:
                 metadata = attn_metadata_builder.update_block_table(
                     cached_metadata[reuse_key], block_table, slot_mapping
