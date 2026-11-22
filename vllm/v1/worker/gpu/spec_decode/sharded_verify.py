@@ -20,6 +20,9 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import _is_bonus_log
 
 # Max, summed exponentials, draft-token logit, Gumbel max, Gumbel argmax.
 NUM_STATS = tl.constexpr(5)
+# Marks NaN winners in the token-id slot: above every token id, and ids up
+# to 2 * NAN_SHIFT stay exact in fp32.
+NAN_SHIFT = tl.constexpr(8388608.0)
 _BLOCK = 4096
 
 
@@ -76,14 +79,19 @@ def _shard_stats_kernel(
     # A block of only NaN logits has a NaN winner, which would fail every
     # equality below and leave no valid token. Rank it under every real
     # value, as rejection_sample does (any real logit, +inf included, beats
-    # an all-NaN block), but above the -inf of empty splits.
-    gv = tl.where(gv != gv, -3.4028234663852886e38, gv)
+    # an all-NaN block), but above the -inf of empty splits. Its token id is
+    # shifted up by NAN_SHIFT so a real score tied at -FLT_MAX wins the
+    # lowest-id tie-break; the verify kernel unshifts the winner.
+    gi = (start + sp * BLOCK + gi).to(tl.float32)
+    is_nan = gv != gv
+    gv = tl.where(is_nan, -3.4028234663852886e38, gv)
+    gi = tl.where(is_nan, gi + NAN_SHIFT, gi)
     out = Stats + (row * splits + sp) * NUM_STATS
     tl.store(out + 0, m)
     tl.store(out + 1, s)
     tl.store(out + 2, xd)
     tl.store(out + 3, gv)
-    tl.store(out + 4, (start + sp * BLOCK + gi).to(tl.float32))
+    tl.store(out + 4, gi)
 
 
 @triton.jit
@@ -170,6 +178,7 @@ def _sharded_verify_kernel(
     gi = tl.load(slot + 4 * stride)
     best = tl.max(gv, axis=0)
     token = tl.min(tl.where(gv == best, gi, 3.0e38), axis=0)
+    token = tl.where(token >= NAN_SHIFT, token - NAN_SHIFT, token)
     tl.store(
         sampled_ptr + req_idx * sampled_stride + accepted_length, token.to(tl.int64)
     )
@@ -193,6 +202,7 @@ def shard_stats(
     (columns at or past `n_valid` ignored)."""
     rows, width = logits.shape
     assert logits.stride(1) == 1
+    assert start + logits.shape[1] <= 1 << 23, "token ids must stay below NAN_SHIFT"
     n_valid = max(0, min(width, n_valid))
     splits = max(1, triton.cdiv(n_valid, _BLOCK))
     stats = torch.empty(
