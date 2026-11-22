@@ -8,6 +8,9 @@ tanh(gain(h)) * message` in fp32, unfused as the reference. The output feeds
 the sublayer's RMSNorm, applied in the same kernel.
 """
 
+import functools
+import os
+
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
@@ -143,6 +146,13 @@ def blend_rms_norm(
 # Up to this many tokens, three wide launches run a whole controller (from
 # 16 tokens the per-stream GEMMs are faster on RTX 3090).
 CONTROLLER_MAX_TOKENS = 8
+
+
+@functools.cache
+def _fused_down_norm() -> bool:
+    """Whether `controller_blend` normalizes inside the down projection
+    (`VLLM_INKLING2_FUSED_CONTROLLER_NORM`, default on)."""
+    return os.environ.get("VLLM_INKLING2_FUSED_CONTROLLER_NORM", "1") == "1"
 # Input columns per `_controller_down_kernel` program.
 _DOWN_SLICE = 256
 # Output columns per `_controller_blend_kernel` program.
@@ -177,6 +187,45 @@ def _controller_down_kernel(
     acc = tl.dot(w, x)
     partial = tl.sum(tl.where(first[None, :], acc, 0.0), 1)
     tl.store(Partials + ((s * T + t) * (D2 // BK) + g) * R + ranks, partial)
+
+
+@triton.jit
+def _controller_down_norm_kernel(
+    Dest,
+    Message,
+    Down,
+    Partials,
+    stride_dest_s,
+    T,
+    eps,
+    D: tl.constexpr,
+    R: tl.constexpr,
+    BK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """`_controller_down_kernel` on the unnormalized fp32 rows: each program
+    RMS-normalizes its slice itself (as `_pair_rms_norm_kernel`), so the
+    `(S, T, 2D)` pair never goes through memory."""
+    g = tl.program_id(0).to(tl.int64)
+    t = tl.program_id(1).to(tl.int64)
+    s = tl.program_id(2).to(tl.int64)
+    half: tl.constexpr = D // BK
+    if g < half:
+        src = Dest + s * stride_dest_s + t * D
+    else:
+        src = Message + (s * T + t) * D
+    cols = tl.arange(0, BLOCK)
+    row = tl.load(src + cols, cols < D, other=0)
+    rstd = rsqrt(tl.div_rn(tl.sum(row * row), D) + eps)
+    x = (tl.load(src + (g % half) * BK + tl.arange(0, BK)) * rstd).to(tl.bfloat16)
+    ks = g * BK + tl.arange(0, BK)
+    ranks = tl.arange(0, R)
+    first = tl.arange(0, 16) == 0
+    x = tl.where(first[None, :], x[:, None], 0.0).to(x.dtype)
+    w = tl.load(Down + s * (R * 2 * D) + ranks[:, None] * (2 * D) + ks[None, :])
+    acc = tl.dot(w, x)
+    partial = tl.sum(tl.where(first[None, :], acc, 0.0), 1)
+    tl.store(Partials + ((s * T + t) * (2 * D // BK) + g) * R + ranks, partial)
 
 
 @triton.jit
@@ -287,22 +336,39 @@ def controller_blend(
     assert down.dtype == gain_forget.dtype == torch.bfloat16
     assert norm_weight.shape == (num_streams, d) and norm_weight.stride(1) == 1
     assert controller_blend_supported(d, rank)
-    pair = pair_rms_norm(dest, message)
     num_slices = 2 * d // _DOWN_SLICE
     partials = message.new_empty((num_streams, num_tokens, num_slices, rank))
     grid = (num_slices, num_tokens, num_streams)
-    _controller_down_kernel[grid](
-        pair,
-        down,
-        partials,
-        pair.stride(0),
-        num_tokens,
-        D2=2 * d,
-        R=rank,
-        BK=_DOWN_SLICE,
-        num_warps=_DOWN_WARPS,
-        num_stages=1,
-    )
+    if _fused_down_norm() and d % _DOWN_SLICE == 0:
+        _controller_down_norm_kernel[grid](
+            dest,
+            message,
+            down,
+            partials,
+            dest.stride(0),
+            num_tokens,
+            1e-6,
+            D=d,
+            R=rank,
+            BK=_DOWN_SLICE,
+            BLOCK=triton.next_power_of_2(d),
+            num_warps=_DOWN_WARPS,
+            num_stages=1,
+        )
+    else:
+        pair = pair_rms_norm(dest, message)
+        _controller_down_kernel[grid](
+            pair,
+            down,
+            partials,
+            pair.stride(0),
+            num_tokens,
+            D2=2 * d,
+            R=rank,
+            BK=_DOWN_SLICE,
+            num_warps=_DOWN_WARPS,
+            num_stages=1,
+        )
     num_chunks = d // _BLEND_SLICE
     mixed = torch.empty_like(message)
     sum_sq = message.new_empty((num_streams, num_tokens, num_chunks))
