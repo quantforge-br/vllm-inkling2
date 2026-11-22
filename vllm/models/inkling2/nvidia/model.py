@@ -72,10 +72,10 @@ from .lora import (
 from .lora import register as register_lora
 from .moe import Inkling2MoE, QuantFormat
 from .moe_ct import PROJECTIONS, Inkling2CTExperts, Inkling2CTScheme
+from .ops import use_portable_kernels
 from .ops.allreduce import Inkling2AllReduceWorkspace
 from .ops.attention import compute_log_scaling_tau
 from .ops.attn_res import attn_res
-from .ops import use_portable_kernels
 from .ops.gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
 from .ops.int4_linear import int4_linear, is_packed_int4, pack_int4_rows
 from .ops.int8_linear import (
@@ -85,7 +85,9 @@ from .ops.int8_linear import (
     is_packed_int8,
     pack_int8_rows,
 )
+from .ops.moe import combine as moe_combine
 from .ops.norm import rms_norm
+from .ops.p2p_conv import p2p_conv_enabled
 from .ops.seq_parallel import SeqParallel
 from .sconv import ATTN_STREAM, MLP_STREAM, Inkling2ShortConv, conv_metadata
 from .vision import Inkling2VisionEncoder, VisionMetadata
@@ -424,8 +426,9 @@ class Inkling2Model(nn.Module):
                         workspace, *mix_args, x=attn_partial, two_shot=attn_two_shot
                     )
                 else:
-                    attn_reduced = tensor_model_parallel_all_reduce(attn_partial)
-                    mlp_in = layer.attn_sconv.conv_mix(attn_reduced, *mix_args)
+                    mlp_in = layer.attn_sconv.conv_mix(
+                        attn_partial, *mix_args, reduce=True
+                    )
             else:
                 attn_out = layer.attn_sconv(
                     tensor_model_parallel_all_reduce(attn_partial), positions
@@ -486,6 +489,17 @@ class Inkling2Model(nn.Module):
                     addend=attn_out,
                     residual=residual,
                     two_shot=moe_two_shot,
+                )
+            elif p2p_conv_enabled():
+                # Each rank's fp32 combine is rounded once to bf16, then
+                # all-reduced inside the short conv.
+                down, src2dst = layer.mlp(mlp_in[0], reduce=False)
+                inputs = layer.mlp_sconv.conv_mix(
+                    moe_combine(down, src2dst, layer.mlp.experts.topk, mlp_in[0].dtype),
+                    *mix_args,
+                    addend=attn_out,
+                    residual=residual,
+                    reduce=True,
                 )
             else:
                 # The MoE output is all-reduced (in bf16) inside layer.mlp.

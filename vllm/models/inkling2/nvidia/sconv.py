@@ -13,7 +13,10 @@ from typing import cast
 import torch
 from torch import nn
 
-from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.inkling.nvidia.sconv_swa_attn import (
@@ -21,9 +24,11 @@ from vllm.models.inkling.nvidia.sconv_swa_attn import (
     InklingSconvMetadata,
 )
 
+from . import ops as _ops
 from .ops.allreduce import Inkling2AllReduceWorkspace, all_reduce_conv_mix
 from .ops.conv_mix import conv_mix as fused_conv_mix
 from .ops.linear import linear_k_groups
+from .ops.p2p_conv import p2p_conv_workspace
 from .ops.sconv import short_conv
 from .ops.seq_parallel import SeqParallel
 
@@ -160,17 +165,31 @@ class Inkling2ShortConv(nn.Module):
         halo: int = 0,
         prefix_align: int = 0,
         owner: InklingConvState | None = None,
+        reduce: bool = False,
     ) -> torch.Tensor:
         """Convolve the reduced `x` into `out` like `forward` and return
         the AttnRes mixes of `[*stack, (last +) out]` with `queries`
         through `norm` (the fp32 mixes without it). With `sp`, the hidden
         stream is this rank's token shard, `x` its reduce-scatter (after
         `halo` rows) and the mixes are all-gathered. `owner` overrides the
-        conv-state cache (a loop pass after the first)."""
+        conv-state cache (a loop pass after the first). With `reduce`, `x`
+        is this rank's TP partial sum: all-reduced inside the conv kernel
+        for small batches (`ops/p2p_conv.py`), else before it."""
         assert not self.dynamic
         if owner is None:
             owner = self.owner
         m = conv_metadata(owner)
+        p2p = None
+        if reduce:
+            assert sp is None
+            p2p = p2p_conv_workspace(x.shape[-1])
+            if (
+                p2p is None
+                or m is None
+                or not _ops.use_portable_kernels()
+                or not p2p.usable(x.shape[0], x.shape[-1])
+            ):
+                x, p2p = tensor_model_parallel_all_reduce(x), None
         cache = owner.kv_cache
         if m is None:
             m, cache, align = self._profile_metadata(positions)
@@ -198,6 +217,7 @@ class Inkling2ShortConv(nn.Module):
             sp=sp,
             halo=halo,
             prefix_align=prefix_align,
+            p2p=p2p,
         )
 
     def all_reduce_mix(

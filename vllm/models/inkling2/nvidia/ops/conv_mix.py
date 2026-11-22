@@ -34,6 +34,7 @@ def conv_mix(
     sp: SeqParallel | None = None,
     halo: int = 0,
     prefix_align: int = 0,
+    p2p=None,
 ) -> torch.Tensor:
     """`short_conv` the reduced bf16 `x` into `conv_out` (with the
     optional `(residual + addend) + y` update), then `attn_res` over
@@ -48,6 +49,9 @@ def conv_mix(
     (returned once all have landed).
     Every rank writes the conv-state cache rows that later steps read (see
     `SeqParallel`) given the batch's `prefix_align`.
+
+    With a `p2p` workspace (`ops/p2p_conv.py`, portable kernels only), `x`
+    is this rank's partial sum, all-reduced inside the short conv.
     """
     num_tokens, d = conv_out.shape
     assert num_tokens > 0 and conv_out.is_contiguous()
@@ -88,6 +92,7 @@ def conv_mix(
     )
     if sp is None:
         assert halo == 0 and positions.shape[0] == num_tokens and x.dim() == 2
+        assert p2p is None or use_portable_kernels()
         if use_portable_kernels():
             # Native conv/mix kernels require Hopper or SM10x. Keep the
             # loop executor's cache writes and residual rounding on SM12x
@@ -106,6 +111,7 @@ def conv_mix(
                 addend,
                 residual,
                 conv_out,
+                p2p,
             )
             return attn_res(
                 stack,
@@ -123,7 +129,7 @@ def conv_mix(
         )
         torch.ops._C.inkling2_conv_mix(*args, out)
         return out
-    assert norm_weight is not None
+    assert norm_weight is not None and p2p is None
     batch_tokens = positions.shape[0]
     token_base, end, _ = sp.shard(batch_tokens)
     assert end - token_base == num_tokens

@@ -95,6 +95,29 @@ def _cached_tap(
 
 
 @triton.jit
+def _input_rows(
+    x_ptr, stride_x, rows, coff, mask, recv_ptr, recv_stride, AR: tl.constexpr
+):
+    """Rows of the conv input; with AR (`ops/p2p_conv.py`), this rank's
+    partial plus the peer's, polled from the receive buffer."""
+    offs = rows[:, None] * stride_x + coff[None, :]
+    mine = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    if AR:
+        recv = recv_ptr + rows[:, None] * recv_stride + coff[None, :]
+        # Wait until no element holds the sentinel (only a scalar is carried
+        # through the loop), then read the landed values once more.
+        pending = 1
+        while pending > 0:
+            peer = tl.load(recv, mask=mask, other=0.0, volatile=True)
+            sentinel = mask & (peer.to(tl.int16, bitcast=True) == -32768)
+            pending = tl.sum(tl.sum(sentinel.to(tl.int32), axis=1), axis=0)
+        peer = tl.load(recv, mask=mask, other=0.0, volatile=True)
+        mine = tl.where(mine == 0.0, 0.0, mine.to(tl.float32))
+        mine = (mine + peer.to(tl.float32)).to(x_ptr.dtype.element_ty)
+    return mine
+
+
+@triton.jit
 def _tap_sum(
     x_ptr,
     stride_x,
@@ -124,6 +147,9 @@ def _tap_sum(
     HEAD_DIM: tl.constexpr,
     preloaded=None,
     READ_CACHE: tl.constexpr = False,
+    recv_ptr=None,
+    recv_stride=0,
+    AR: tl.constexpr = False,
 ):
     """Weighted sum of the W taps; earlier steps' taps come from
     `preloaded` or, with READ_CACHE, from the cache (else they are zero)."""
@@ -137,10 +163,15 @@ def _tap_sum(
         intra = in_win & (row >= qstart)
         cached = in_win & (row < qstart)
         xt = (
-            tl.load(
-                x_ptr + tl.maximum(row, 0)[:, None] * stride_x + coff[None, :],
-                mask=c_mask[None, :] & intra[:, None],
-                other=0.0,
+            _input_rows(
+                x_ptr,
+                stride_x,
+                tl.maximum(row, 0),
+                coff,
+                c_mask[None, :] & intra[:, None],
+                recv_ptr,
+                recv_stride,
+                AR,
             )
             .to(dtype)
             .to(tl.float32)
@@ -216,6 +247,9 @@ def _conv(
     SKIP_IDLE_CACHE: tl.constexpr = False,
     CACHE_FIRST: tl.constexpr = False,
     tile_reads_cache=True,
+    recv_ptr=None,
+    recv_stride=0,
+    AR: tl.constexpr = False,
 ):
     """Store the current inputs to the cache; return `y` in fp32.
 
@@ -253,7 +287,7 @@ def _conv(
         gdc_wait()
 
     dtype = cache_ptr.dtype.element_ty
-    cur = tl.load(x_ptr + toff[:, None] * stride_x + coff[None, :], mask=tc_mask)
+    cur = _input_rows(x_ptr, stride_x, toff, coff, tc_mask, recv_ptr, recv_stride, AR)
     cur = cur.to(dtype)
     safe_slot = tl.maximum(slot, 0)
     dst = (
@@ -292,11 +326,40 @@ def _conv(
     # from the cache; SKIP_IDLE_CACHE branches around the others' loads once.
     if CACHE_FIRST:
         preloaded = (cached0, cached1, cached2, cached3)
-        acc = _tap_sum(*tap_args, W, dyn_ptr, stride_dyn, HEAD_DIM, preloaded)
+        acc = _tap_sum(
+            *tap_args,
+            W,
+            dyn_ptr,
+            stride_dyn,
+            HEAD_DIM,
+            preloaded,
+            recv_ptr=recv_ptr,
+            recv_stride=recv_stride,
+            AR=AR,
+        )
     elif not SKIP_IDLE_CACHE or tile_reads_cache:
-        acc = _tap_sum(*tap_args, W, dyn_ptr, stride_dyn, HEAD_DIM, READ_CACHE=True)
+        acc = _tap_sum(
+            *tap_args,
+            W,
+            dyn_ptr,
+            stride_dyn,
+            HEAD_DIM,
+            READ_CACHE=True,
+            recv_ptr=recv_ptr,
+            recv_stride=recv_stride,
+            AR=AR,
+        )
     else:
-        acc = _tap_sum(*tap_args, W, dyn_ptr, stride_dyn, HEAD_DIM)
+        acc = _tap_sum(
+            *tap_args,
+            W,
+            dyn_ptr,
+            stride_dyn,
+            HEAD_DIM,
+            recv_ptr=recv_ptr,
+            recv_stride=recv_stride,
+            AR=AR,
+        )
     return (acc + cur.to(tl.float32)) * scale
 
 
@@ -333,6 +396,12 @@ def _sconv_kernel(
     BT: tl.constexpr,
     BLOCK_C: tl.constexpr,
     SKIP_IDLE_CACHE: tl.constexpr,
+    recv_addr=0,
+    peer_addr=0,
+    counter_ptr=None,
+    GEN_NUMEL: tl.constexpr = 0,
+    MAX_T: tl.constexpr = 0,
+    AR: tl.constexpr = False,
 ):
     first = tl.program_id(0) * BT
     tile_reads_cache = True
@@ -348,6 +417,23 @@ def _sconv_kernel(
     C = H * WS
     t_mask = toff < T
     c_mask = coff < C
+    recv_ptr = x_ptr
+    if AR:
+        # Push this program's rows of the partial into the peer's buffer.
+        gen = tl.load(counter_ptr, volatile=True)
+        base = (gen % 3) * GEN_NUMEL
+        recv_ptr = recv_addr.to(tl.pointer_type(x_ptr.dtype.element_ty)) + base
+        peer_ptr = peer_addr.to(tl.pointer_type(x_ptr.dtype.element_ty)) + base
+        push_mask = t_mask[:, None] & c_mask[None, :]
+        mine = tl.load(
+            x_ptr + toff[:, None] * stride_x + coff[None, :], mask=push_mask, other=0.0
+        )
+        mine = tl.where(mine == 0.0, 0.0, mine.to(tl.float32))
+        tl.store(
+            peer_ptr + toff[:, None] * C + coff[None, :],
+            mine.to(x_ptr.dtype.element_ty),
+            mask=push_mask,
+        )
     y = _conv(
         x_ptr,
         stride_x,
@@ -375,6 +461,9 @@ def _sconv_kernel(
         SKIP_IDLE_CACHE=SKIP_IDLE_CACHE,
         CACHE_FIRST=not SKIP_IDLE_CACHE,
         tile_reads_cache=tile_reads_cache,
+        recv_ptr=recv_ptr,
+        recv_stride=C,
+        AR=AR,
     ).to(out_ptr.dtype.element_ty)
     offs = toff[:, None] * C + coff[None, :]
     mask = t_mask[:, None] & c_mask[None, :]
@@ -385,6 +474,22 @@ def _sconv_kernel(
             acc = tl.load(res_ptr + offs, mask, other=0).to(tl.float32) + acc
         y = (acc + y.to(tl.float32)).to(out_ptr.dtype.element_ty)
     tl.store(out_ptr + offs, y, mask=mask)
+    if AR:
+        # Re-arm every row of the generation used two launches ago.
+        stale = recv_addr.to(tl.pointer_type(tl.int16)) + ((gen + 2) % 3) * GEN_NUMEL
+        for j in tl.static_range(MAX_T):
+            rows = toff + j * T
+            keep = (t_mask & (rows < MAX_T))[:, None] & c_mask[None, :]
+            tl.store(
+                stale + rows[:, None] * C + coff[None, :],
+                tl.full((BT, BLOCK_C), -32768, tl.int16),
+                mask=keep,
+            )
+        # The last program advances the generation.
+        total = tl.num_programs(0) * tl.num_programs(1)
+        if tl.atomic_add(counter_ptr + 1, 1) == total - 1:
+            tl.store(counter_ptr + 1, 0)
+            tl.store(counter_ptr, gen + 1)
 
 
 def short_conv(
@@ -401,12 +506,15 @@ def short_conv(
     addend: torch.Tensor | None = None,
     residual: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    p2p=None,
 ) -> torch.Tensor:
     """Insert `x` (rounded to the cache dtype) into the conv-state cache and
     return the static convolution with `(C, W)` taps `weight`.
 
     With `addend`, returns `(residual + addend) + y` accumulated in fp32
-    (`residual` may alias `out`).
+    (`residual` may alias `out`). With a `p2p` workspace
+    (`ops/p2p_conv.py`), `x` is this rank's partial and is all-reduced
+    in the same launch.
     """
     num_tokens, channels = x.shape
     if out is None:
@@ -426,6 +534,22 @@ def short_conv(
         block_t, block_c = (4, 256) if prefill else (2, 512)
     block_c = min(triton.next_power_of_2(channels), block_c)
     grid = (triton.cdiv(num_tokens, block_t), triton.cdiv(channels, block_c))
+    ar = {}
+    if p2p is not None:
+        # More, narrower programs overlap the peer round trips (7.6 us per
+        # 8-token call at 128 channels vs 17.0 us at 1024).
+        block_c = 128
+        grid = (triton.cdiv(num_tokens, block_t), triton.cdiv(channels, block_c))
+        assert p2p.usable(num_tokens, channels) and block_t == 1
+        assert x.dtype == torch.bfloat16 and x.stride(0) == channels
+        ar = dict(
+            recv_addr=p2p.recv_addr,
+            peer_addr=p2p.peer_addr,
+            counter_ptr=p2p.counter,
+            GEN_NUMEL=p2p.generation_numel,
+            MAX_T=p2p.max_tokens,
+            AR=True,
+        )
     _sconv_kernel[grid](
         x,
         cache,
@@ -461,6 +585,7 @@ def short_conv(
         num_warps=4,
         enable_fp_fusion=False,
         launch_pdl=PDL,
+        **ar,
     )
     return out
 

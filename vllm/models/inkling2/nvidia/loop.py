@@ -17,8 +17,6 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
-from vllm.distributed import tensor_model_parallel_all_reduce
-
 from ..configs import Inkling2ModelConfig
 from ..quant_config import Inkling2QuantConfig
 from .model import (
@@ -36,6 +34,8 @@ from .ops.loop import (
     controller_blend_supported,
     pair_rms_norm,
 )
+from .ops.moe import combine as moe_combine
+from .ops.p2p_conv import p2p_conv_enabled
 from .sconv import conv_metadata
 
 LOOP_STREAMS = ("attn", "k", "v", "mlp")
@@ -307,8 +307,9 @@ class Inkling2LoopModel(Inkling2Model):
                 owner=owner,
             )
         else:
-            attn_reduced = tensor_model_parallel_all_reduce(attn_partial)
-            mlp_in = layer.attn_sconv.conv_mix(attn_reduced, *mix_args, owner=owner)
+            mlp_in = layer.attn_sconv.conv_mix(
+                attn_partial, *mix_args, owner=owner, reduce=True
+            )
         if messages is not None:
             assert isinstance(layer, Inkling2LoopDecoderLayer)
             norm = layer.mlp_norm
@@ -338,6 +339,18 @@ class Inkling2LoopModel(Inkling2Model):
                 residual=residual,
                 two_shot=moe_two_shot,
                 owner=owner,
+            )
+        elif p2p_conv_enabled():
+            # Each rank's fp32 combine is rounded once to bf16, then
+            # all-reduced inside the short conv.
+            down, src2dst = layer.mlp(mlp_in[0], reduce=False, pass_idx=pass_idx)
+            outputs = layer.mlp_sconv.conv_mix(
+                moe_combine(down, src2dst, layer.mlp.experts.topk, mlp_in[0].dtype),
+                *mix_args,
+                addend=attn_out,
+                residual=residual,
+                owner=owner,
+                reduce=True,
             )
         else:
             # The MoE output is all-reduced (in bf16) inside layer.mlp.
