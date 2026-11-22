@@ -51,6 +51,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig, KVQuan
 from ..configs import Inkling2ModelConfig
 from .lora import add_linear_lora
 from .ops import use_portable_kernels, use_sm100_kernels
+from .ops.marlin_linear import dense_bits, is_packed_marlin, marlin_parameter
 from .ops.int8_linear import (
     int8_dense_enabled,
     int8_gemv_slices,
@@ -328,6 +329,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 )
         if cache_dtype == "float16" and vllm_config.speculative_config is not None:
             raise ValueError("Inkling2 FP16 KV requires speculative decoding disabled")
+        # LoRA wrappers and reloads expect the bf16 / int8 layouts.
+        self.marlin_dense = dense_bits() == 4 and vllm_config.lora_config is None
         self.kv_cache = torch.tensor([])
         forward_context = vllm_config.compilation_config.static_forward_context
         if prefix in forward_context:
@@ -341,6 +344,18 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if int8_dense_enabled() and use_portable_kernels():
             # W8A16 projections: half the bytes of the bf16 GEMVs at decode.
             for proj in (self.qkvr, self.wo_ud):
+                if self.marlin_dense:
+                    # The Marlin scales and zero points live outside the
+                    # parameter storage: a reload or a processed-weight cache
+                    # would pair new codes with stale (or missing) metadata.
+                    if is_packed_marlin(proj.weight) or not proj.weight.is_floating_point():
+                        raise RuntimeError(
+                            "Inkling2 Marlin W4 projections "
+                            "(VLLM_INKLING2_DENSE_BITS=4) cannot be reloaded or "
+                            "restored from processed weights; restart the engine"
+                        )
+                    proj.weight = marlin_parameter(proj.weight.data)
+                    continue
                 proj.weight = nn.Parameter(
                     pack_int8_rows(proj.weight.data), requires_grad=False
                 )
@@ -376,6 +391,18 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
         k_end = q_side + kv_size
         fused = None
+        if is_packed_marlin(weight):
+            # One Marlin call on the stacked rows reads the 4-bit weight once;
+            # each input keeps only its own column block.
+            m = x_q.shape[0]
+            y = linear(torch.cat((x_q, x_k, x_v)), weight)
+            projected = y[:m, : sum(self.q_side_splits)]
+            k = y[m : 2 * m, q_side:k_end]
+            v = y[2 * m :, k_end : k_end + kv_size]
+            add_linear_lora(self.qkvr, projected, x_q, range(4))
+            add_linear_lora(self.qkvr, k, x_k, [4])
+            add_linear_lora(self.qkvr, v, x_v, [5])
+            return [*projected.split(self.q_side_splits, dim=-1)[:4], k, v]
         if is_packed_int8(weight) and self.q_side_splits[4] == 0:
             # Decode: the three projections share one launch.
             fused = int8_gemv_slices(

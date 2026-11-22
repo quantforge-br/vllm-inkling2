@@ -18,6 +18,7 @@ from . import (
 from .gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
 from .int4_linear import int4_linear, is_packed_int4
 from .int8_linear import int8_linear, is_packed_int8
+from .marlin_linear import is_packed_marlin, marlin_linear
 
 # Up to this many rows, FlashInfer's CuTe DSL low-M kernels run near HBM
 # bandwidth (cuBLAS is up to 2x slower); larger batches use cuBLAS.
@@ -29,6 +30,8 @@ def linear(
 ) -> torch.Tensor:
     """bf16 `x @ weight.T` with fp32 accumulation (into `out` if given,
     batches over LOW_M_MAX_TOKENS only)."""
+    if is_packed_marlin(weight):
+        return marlin_linear(x, weight, out)
     if is_packed_int8(weight):
         return int8_linear(x, weight, out)
     if is_packed_int4(weight):
