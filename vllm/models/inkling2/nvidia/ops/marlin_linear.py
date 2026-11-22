@@ -147,9 +147,13 @@ def marlin_linear(
 _ATTRS = ("marlin_n", "marlin_k", "marlin_scale", "marlin_zero")
 
 
-def marlin_parameter(weight: torch.Tensor) -> nn.Parameter:
-    """Round-to-nearest Marlin W4A16 parameter of a bf16 `[N, K]` weight."""
-    packed = pack_marlin_w4(*quantize_w4_asym(weight))
+def marlin_parameter(
+    weight: torch.Tensor,
+    quantized: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> nn.Parameter:
+    """Marlin W4A16 parameter of a bf16 `[N, K]` weight: round-to-nearest, or
+    the given `(codes, scales, zeros)` (e.g. from GPTQ)."""
+    packed = pack_marlin_w4(*(quantized or quantize_w4_asym(weight)))
     param = nn.Parameter(packed, requires_grad=False)
     for name in _ATTRS:
         setattr(param, name, getattr(packed, name))

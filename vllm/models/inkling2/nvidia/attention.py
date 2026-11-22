@@ -51,6 +51,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig, KVQuan
 from ..configs import Inkling2ModelConfig
 from .lora import add_linear_lora
 from .ops import use_portable_kernels, use_sm100_kernels
+from .ops.gptq import COLLECTOR, collect_dir, hessian_dir, quantize_projection
 from .ops.marlin_linear import dense_bits, is_packed_marlin, marlin_parameter
 from .ops.int8_linear import (
     int8_dense_enabled,
@@ -354,11 +355,29 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                             "(VLLM_INKLING2_DENSE_BITS=4) cannot be reloaded or "
                             "restored from processed weights; restart the engine"
                         )
-                    proj.weight = marlin_parameter(proj.weight.data)
+                    gptq = None
+                    if hessian_dir() is not None:
+                        gptq = quantize_projection(
+                            f"{self.prefix}.{'qkvr' if proj is self.qkvr else 'wo'}",
+                            proj.weight.data,
+                            self._gptq_row_blocks(proj),
+                        )
+                    proj.weight = marlin_parameter(proj.weight.data, gptq)
                     continue
                 proj.weight = nn.Parameter(
                     pack_int8_rows(proj.weight.data), requires_grad=False
                 )
+
+    def _gptq_row_blocks(self, proj: nn.Module) -> list[tuple[str, int]]:
+        """Row blocks of a projection by the input they read (see `_project`)."""
+        rows = proj.weight.shape[0]
+        if proj is self.wo_ud or self.is_local:
+            return [("x", rows)]
+        q_side, kv = sum(self.split_sizes[:4]), self.split_sizes[4]
+        blocks = [("q", q_side), ("k", kv), ("v", kv)]
+        if rows > q_side + 2 * kv:
+            blocks.append(("q", rows - q_side - 2 * kv))
+        return blocks
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return Inkling2AttentionBackend
@@ -384,6 +403,12 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         # ``linear`` on the weight bypasses the layer (and a LoRA wrapper's
         # forward), so the LoRA deltas are added here (no-op without LoRA).
         weight = self.qkvr.weight
+        if collect_dir() is not None:
+            if x_k is x_q and x_v is x_q:
+                COLLECTOR.add(f"{self.prefix}.qkvr.x", x_q)
+            else:
+                for key, x in (("q", x_q), ("k", x_k), ("v", x_v)):
+                    COLLECTOR.add(f"{self.prefix}.qkvr.{key}", x)
         if x_k is x_q and x_v is x_q:
             projected = linear(x_q, weight)
             add_linear_lora(self.qkvr, projected, x_q, range(6))
@@ -479,6 +504,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             output,
             pass_idx,
         )
+        if collect_dir() is not None:
+            COLLECTOR.add(f"{self.prefix}.wo.x", output)
         out = linear(output, self.wo_ud.weight, out)
         add_linear_lora(self.wo_ud, out, output)
         return out
