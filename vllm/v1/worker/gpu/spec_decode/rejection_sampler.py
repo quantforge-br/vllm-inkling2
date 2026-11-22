@@ -466,6 +466,17 @@ class RejectionSampler:
         """Whether `verify_target_ids` matches `__call__` for this batch:
         every request greedy, with no logits processing, logprobs or
         verification variants."""
+        return self._supports_sharded(input_batch, 0.0)
+
+    def supports_logits_shard(self, input_batch: InputBatch) -> bool:
+        """Whether `verify_logits_shard` matches `__call__` for this batch:
+        every request at temperature 1.0 with unprocessed logits, one-hot
+        drafts, fp32 Gumbel noise and no logprobs or verification variants."""
+        return not self.sampler.use_fp64_gumbel and self._supports_sharded(
+            input_batch, 1.0
+        )
+
+    def _supports_sharded(self, input_batch: InputBatch, temperature: float) -> bool:
         sampler = self.sampler
         idx = input_batch.idx_mapping_np
         return (
@@ -478,10 +489,70 @@ class RejectionSampler:
             and not sampler.compute_nans
             and not sampler.return_sampling_mask
             and sampler.trace_replay_state is None
-            and bool(np.all(sampler.sampling_states.temperature.np[idx] == 0.0))
+            and bool(np.all(sampler.sampling_states.temperature.np[idx] == temperature))
             and not np.any(sampler.needs_logits_processing[idx])
             and not np.any(sampler.may_mask_logits[idx])
             and sampler.get_logprobs_dims(idx) is None
+        )
+
+    def verify_logits_shard(
+        self, logits: torch.Tensor, start: int, n_valid: int, input_batch: InputBatch
+    ) -> SamplerOutput:
+        """Verification at temperature 1.0 from this TP rank's vocabulary
+        shard of the target logits (see `supports_logits_shard`)."""
+        from vllm.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+            tensor_model_parallel_all_reduce,
+        )
+
+        from .sharded_verify import shard_stats, sharded_verify
+
+        draft_sampled, pos = gather_draft_sampled(
+            input_batch.input_ids,
+            input_batch.positions,
+            input_batch.logits_indices,
+            input_batch.expanded_idx_mapping,
+            input_batch.expanded_local_pos,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        seeds = self.sampler.sampling_states.seeds.gpu
+        packed = shard_stats(
+            logits,
+            start,
+            n_valid,
+            get_tensor_model_parallel_rank(),
+            get_tensor_model_parallel_world_size(),
+            draft_sampled,
+            pos,
+            input_batch.expanded_idx_mapping,
+            input_batch.expanded_local_pos,
+            seeds,
+        )
+        sampled, num_sampled = sharded_verify(
+            tensor_model_parallel_all_reduce(packed),
+            draft_sampled,
+            pos,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            seeds,
+            input_batch.num_reqs,
+            self.num_speculative_steps,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            sampling_mask_tensors=None,
         )
 
     def verify_target_ids(

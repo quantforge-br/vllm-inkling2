@@ -791,6 +791,16 @@ class Inkling2ForConditionalGeneration(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def compute_logits_shard(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, int, int]:
+        """This TP rank's fp32 final logits `(T, shard)` of `hidden_states`,
+        the global id of their first column and how many columns are real
+        vocabulary (the rest is padding)."""
+        logits = self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+        start = self.lm_head.shard_indices.org_vocab_start_index
+        return logits.contiguous(), start, self.logits_processor.org_vocab_size - start
+
     def compute_greedy_target_ids(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """int64 argmax over the full vocabulary of the final logits of
         `hidden_states`, without all-gathering them: each TP rank reduces its

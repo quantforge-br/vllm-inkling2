@@ -504,6 +504,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and hasattr(self.model, "compute_greedy_target_ids")
             and os.environ.get("VLLM_SHARDED_GREEDY_VERIFY", "1") == "1"
         )
+        # Likewise at temperature 1.0 (VLLM_SHARDED_SAMPLE_VERIFY=0 disables).
+        self.sharded_sample_verify = (
+            getattr(self, "batch_sharder", None) is None
+            and self.parallel_config.tensor_parallel_size in (2, 4, 8)
+            and hasattr(self.model, "compute_logits_shard")
+            and os.environ.get("VLLM_SHARDED_SAMPLE_VERIFY", "1") == "1"
+        )
 
         # Initialize samplers. Model states may override via custom_sampler().
         config_processors = self.model_config.logits_processors or ()
@@ -1773,6 +1780,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             sampler_output = self.rejection_sampler.verify_target_ids(
                 target_ids, input_batch
+            )
+            return (
+                sampler_output,
+                sampler_output.num_sampled,
+                sampler_output.num_rejected,
+            )
+        if (
+            self.sharded_sample_verify
+            and grammar_output is None
+            and self.batch_sharder is None
+            and input_batch.num_reqs > 0
+            and input_batch.num_draft_tokens > 0
+            and self.rejection_sampler is not None
+            and self.speculator is not None
+            and self.speculator.draft_logits is None
+            and self.rejection_sampler.supports_logits_shard(input_batch)
+        ):
+            # Temperature-1.0 verification needs per row only the target
+            # log-sum-exp, draft-token logit and residual Gumbel winner:
+            # reduce them per vocabulary shard instead of all-gathering.
+            logits, start, n_valid = self.model.compute_logits_shard(
+                hidden_states[input_batch.logits_indices]
+            )
+            sampler_output = self.rejection_sampler.verify_logits_shard(
+                logits, start, n_valid, input_batch
             )
             return (
                 sampler_output,
