@@ -96,6 +96,92 @@ def pack_marlin_w4(
     return q
 
 
+# The uint4b8 zero (code 8) in every nibble of an int32 word.
+INT4_ZERO_WORD = -0x77777778
+
+
+def register_packed_int4(proj: nn.Module) -> None:
+    """Replaces the bf16 `weight` of a vLLM linear layer by this TP rank's
+    shard of compressed-tensors `pack-quantized` symmetric int4 tensors
+    (`weight_packed` `[N, K / 8]` int32, `weight_scale` `[N, K / GROUP]`
+    bf16), loaded by the layer's own weight loader; rows no checkpoint
+    tensor fills (alignment padding) stay zero. `finalize_packed_int4`
+    turns them into the Marlin weight after loading."""
+    from vllm.model_executor.parameter import (
+        GroupQuantScaleParameter,
+        PackedvLLMParameter,
+    )
+
+    weight = proj.weight
+    n, k = weight.shape
+    assert k % GROUP == 0, k
+    loader, device = weight.weight_loader, weight.device
+    del proj.weight
+    # The linear method's post-load hook reads `weight`.
+    proj.weight = torch.empty(0, device=device)
+    packed = PackedvLLMParameter(
+        data=torch.full((n, k // 8), INT4_ZERO_WORD, dtype=torch.int32, device=device),
+        input_dim=1,
+        output_dim=0,
+        packed_dim=1,
+        packed_factor=8,
+        weight_loader=loader,
+    )
+    scale = GroupQuantScaleParameter(
+        data=torch.zeros((n, k // GROUP), dtype=torch.bfloat16, device=device),
+        input_dim=1,
+        output_dim=0,
+        weight_loader=loader,
+    )
+    proj.register_parameter("weight_packed", packed)
+    proj.register_parameter("weight_scale", scale)
+
+
+def finalize_packed_int4(proj: nn.Module) -> None:
+    """The Marlin W4A16 `weight` of a `register_packed_int4` layer."""
+    if not hasattr(proj, "weight_packed"):
+        raise RuntimeError(
+            "Inkling2 int4 checkpoint projections cannot be reloaded; restart "
+            "the engine"
+        )
+    codes = unpack_ct_int4(proj.weight_packed.data)
+    scale = proj.weight_scale.data
+    del proj.weight_packed, proj.weight_scale
+    proj.weight = marlin_parameter(None, (codes, scale))
+
+
+def unpack_ct_int4(packed: torch.Tensor) -> torch.Tensor:
+    """uint8 codes `[N, K]` of compressed-tensors `pack-quantized` int4
+    words `[N, K / 8]` (eight columns per int32, first in the low bits)."""
+    shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=packed.device)
+    codes = (packed.unsqueeze(-1) >> shifts) & 0xF
+    return codes.reshape(packed.shape[0], -1).to(torch.uint8)
+
+
+def pack_marlin_w4_sym(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Marlin tensor for symmetric `uint4b8` codes `[N, K]` (`q + 8`) and
+    positive bf16 scales `[N, K/GROUP]` (no zero points). N is padded to a
+    multiple of 64 with zero rows (code 8)."""
+    n, k = codes.shape
+    pad = -n % _N_ALIGN
+    if pad:
+        codes = torch.nn.functional.pad(codes, (0, 0, 0, pad), value=8)
+        scale = torch.nn.functional.pad(scale, (0, 0, 0, pad))
+    size_n = n + pad
+    nibbles = codes.t().contiguous().to(torch.int32).view(k // 8, 8, size_n)
+    shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=codes.device)
+    gptq = (nibbles << shifts.view(1, 8, 1)).sum(dim=1, dtype=torch.int32)
+    q = ops.gptq_marlin_repack(gptq, k, size_n, 4)
+    q.marlin_n = n
+    q.marlin_k = k
+    q.marlin_scale = marlin_permute_scales(
+        scale.to(torch.bfloat16).t().contiguous(), k, size_n, GROUP
+    ).to(codes.device)
+    q.marlin_zero = None
+    q.marlin_type = scalar_types.uint4b8
+    return q
+
+
 def marlin_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -145,19 +231,25 @@ def marlin_linear(
     return y.reshape(*lead, n)
 
 
-_ATTRS = ("marlin_n", "marlin_k", "marlin_scale", "marlin_zero")
+_ATTRS = ("marlin_n", "marlin_k", "marlin_scale", "marlin_zero", "marlin_type")
 
 
 def marlin_parameter(
-    weight: torch.Tensor,
-    quantized: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    weight: torch.Tensor | None,
+    quantized: tuple[torch.Tensor, ...] | None = None,
 ) -> nn.Parameter:
     """Marlin W4A16 parameter of a bf16 `[N, K]` weight: round-to-nearest, or
-    the given `(codes, scales, zeros)` (e.g. from GPTQ)."""
-    packed = pack_marlin_w4(*(quantized or quantize_w4_asym(weight)))
+    the given asymmetric `(codes, scales, zeros)` (e.g. from GPTQ) or
+    symmetric `uint4b8` `(codes, scales)` (e.g. from the checkpoint)."""
+    if quantized is not None and len(quantized) == 2:
+        packed = pack_marlin_w4_sym(*quantized)
+    else:
+        assert quantized is not None or weight is not None
+        packed = pack_marlin_w4(*(quantized or quantize_w4_asym(weight)))
     param = nn.Parameter(packed, requires_grad=False)
     for name in _ATTRS:
-        setattr(param, name, getattr(packed, name))
+        if hasattr(packed, name):
+            setattr(param, name, getattr(packed, name))
     return param
 
 

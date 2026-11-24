@@ -91,3 +91,91 @@ def test_gptq_w4_sym_batch_matches_single_matrices():
         # Batched and single GEMMs may round differently near ties.
         assert (c1 != codes[b]).float().mean() < 0.01
         torch.testing.assert_close(s1, scales[b], rtol=1e-2, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_pack_marlin_w4_sym_matches_dequantized_matmul():
+    from vllm.models.inkling2.nvidia.ops.marlin_linear import (
+        marlin_linear,
+        marlin_parameter,
+    )
+
+    torch.manual_seed(0)
+    n, k = 200, 512  # n pads to 256
+    codes = torch.randint(0, 16, (n, k), dtype=torch.uint8, device="cuda")
+    scales = (torch.rand(n, k // 128, device="cuda") * 0.01 + 1e-3).bfloat16()
+    weight = marlin_parameter(None, (codes, scales))
+    x = torch.randn(5, k, device="cuda", dtype=torch.bfloat16)
+    want = x.float() @ gptq.dequantize_w4_sym(codes, scales).t()
+    got = marlin_linear(x, weight).float()
+    torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+
+
+def test_unpack_ct_int4_inverts_compressed_tensors_packing():
+    from vllm.models.inkling2.nvidia.moe_ct import _pack_cols
+    from vllm.models.inkling2.nvidia.ops.marlin_linear import unpack_ct_int4
+
+    torch.manual_seed(0)
+    q = torch.randint(-8, 8, (24, 256), dtype=torch.int8)
+    codes = unpack_ct_int4(_pack_cols(q, 4))
+    assert codes.dtype == torch.uint8
+    assert torch.equal(codes.to(torch.int16) - 8, q.to(torch.int16))
+
+
+def _ct_tensors(n: int, k: int, device: str):
+    """Random symmetric int4 codes, positive scales and their CT tensors."""
+    from vllm.models.inkling2.nvidia.moe_ct import _pack_cols
+
+    codes = torch.randint(0, 16, (n, k), dtype=torch.uint8, device=device)
+    scales = (torch.rand(n, k // 128, device=device) * 0.01 + 1e-3).bfloat16()
+    packed = _pack_cols(codes.to(torch.int8) - 8, 4)
+    return codes, scales, packed
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_packed_int4_layers_load_shards_into_marlin(dist_init, default_vllm_config):
+    from vllm.model_executor.layers.linear import (
+        MergedColumnParallelLinear,
+        QKVParallelLinear,
+        RowParallelLinear,
+    )
+    from vllm.models.inkling2.nvidia.ops.linear import linear
+    from vllm.models.inkling2.nvidia.ops.marlin_linear import (
+        finalize_packed_int4,
+        register_packed_int4,
+    )
+
+    torch.manual_seed(0)
+    device, k = "cuda", 256
+    with torch.device(device):
+        merged = MergedColumnParallelLinear(k, [192, 24, 8], bias=False)
+        qkv = QKVParallelLinear(k, 64, 2, 1, bias=False)
+        row = RowParallelLinear(k, 128, bias=False, reduce_results=False)
+    cases = []
+    for layer, shards in (
+        (merged, [(0, 192), (1, 24)]),  # the last output (padding) stays empty
+        (qkv, [("q", 128), ("k", 64), ("v", 64)]),
+        (row, [(None, 128)]),
+    ):
+        register_packed_int4(layer)
+        blocks = []
+        for shard, n in shards:
+            codes, scales, packed = _ct_tensors(n, k, device)
+            for name, tensor in (("weight_packed", packed), ("weight_scale", scales)):
+                param = getattr(layer, name)
+                if shard is None:
+                    param.weight_loader(param, tensor)
+                else:
+                    param.weight_loader(param, tensor, shard)
+            blocks.append(gptq.dequantize_w4_sym(codes, scales))
+        finalize_packed_int4(layer)
+        cases.append((layer, torch.cat(blocks)))
+    x = torch.randn(3, k, device=device, dtype=torch.bfloat16)
+    for layer, want in cases:
+        got = linear(x, layer.weight).float()
+        assert not hasattr(layer, "weight_packed")
+        torch.testing.assert_close(
+            got[:, : want.shape[0]], x.float() @ want.t(), rtol=2e-2, atol=2e-2
+        )
+        if got.shape[1] > want.shape[0]:
+            assert not got[:, want.shape[0] :].any()

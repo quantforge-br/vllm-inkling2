@@ -905,6 +905,10 @@ class Inkling2ForConditionalGeneration(
                     name = name.replace(old, new)
                     shard_id = shard
                     break
+            if name.endswith(".attn.qkvr.weight_shape") or name.endswith(
+                ".attn.wo_ud.weight_shape"
+            ):
+                continue  # Metadata of the packed int4 attention projections.
             expert = self._ct_expert.fullmatch(name)
             if expert is not None:
                 experts, expert_id, projection, key = expert.groups()

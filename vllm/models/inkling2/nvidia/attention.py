@@ -74,7 +74,14 @@ from .ops.int8_linear import (
     pack_int8_rows,
 )
 from .ops.linear import linear
-from .ops.marlin_linear import dense_bits, is_packed_marlin, marlin_parameter
+from .ops.marlin_linear import (
+    GROUP,
+    dense_bits,
+    finalize_packed_int4,
+    is_packed_marlin,
+    marlin_parameter,
+    register_packed_int4,
+)
 from .ops.sconv import attention_prologue, shift_rel_proj
 from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
 
@@ -195,6 +202,49 @@ class Inkling2AttentionPassCache(nn.Module, AttentionLayerBase):
         )
 
 
+# Checkpoint names of the fused `qkvr` rows (in `split_sizes` order) and of
+# the output projection.
+_QKVR_NAMES = ("wq_du", "wr_du", "gate_attn", "attn_sink_proj", "wk_dv", "wv_dv")
+_W4_NAMES = (*_QKVR_NAMES, "wo_ud")
+
+
+def checkpoint_w4_projections(prefix: str) -> bool:
+    """Whether the checkpoint stores the projections of the attention layer
+    at `prefix` as symmetric int4 (compressed-tensors `pack-quantized`,
+    groups of 128, report B2), to load straight into Marlin."""
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+        CompressedTensorsConfig,
+    )
+
+    quant_config = get_current_vllm_config().quant_config
+    if not isinstance(quant_config, CompressedTensorsConfig):
+        return False
+    probe = nn.Linear(1, 1, bias=False, device="meta")
+    schemes = [
+        quant_config.get_scheme_dict(probe, f"{prefix}.{name}") for name in _W4_NAMES
+    ]
+    if all(s is None for s in schemes):
+        return False
+    for name, s in zip(_W4_NAMES, schemes):
+        w = None if s is None else s["weights"]
+        if (
+            w is None
+            or s["format"] != "pack-quantized"
+            or s.get("input_activations") is not None
+            or getattr(w.type, "value", w.type) != "int"
+            or w.num_bits != 4
+            or not w.symmetric
+            or getattr(w.strategy, "value", w.strategy) != "group"
+            or w.group_size != GROUP
+        ):
+            raise ValueError(
+                f"{prefix}.{name}: Inkling2 attention projections load only as "
+                f"symmetric int4 pack-quantized groups of {GROUP}, all together "
+                f"(scheme {s})"
+            )
+    return True
+
+
 class Inkling2Attention(nn.Module, AttentionLayerBase):
     """Inkling2 attention for one decoder layer.
 
@@ -276,6 +326,9 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             reduce_results=False,
             prefix=f"{prefix}.wo_ud",
         )
+        self.w4_checkpoint = checkpoint_w4_projections(prefix)
+        if self.w4_checkpoint:
+            self._register_w4_checkpoint()
         self.rel_logits_proj = nn.Parameter(
             torch.empty(self.d_rel, self.rel_extent), requires_grad=False
         )
@@ -356,8 +409,33 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if vllm_config.kernel_config.enable_jit_warmup and use_sm100_kernels():
             _INKLING2_FA4_REL_ATTENTION_KERNEL.register_warmup()
 
+    def _register_w4_checkpoint(self) -> None:
+        """Loads `qkvr` / `wo_ud` from the checkpoint's packed int4 codes and
+        scales (see `checkpoint_w4_projections`) into Marlin."""
+        if not (self.marlin_dense_requested() and int8_dense_enabled()):
+            raise ValueError(
+                "Inkling2 int4 attention checkpoints need the Marlin W4 dense "
+                "projections (VLLM_INKLING2_INT8_DENSE=1, "
+                "VLLM_INKLING2_DENSE_BITS=4, portable kernels, no LoRA)"
+            )
+        for proj in (self.qkvr, self.wo_ud):
+            register_packed_int4(proj)
+
+    @staticmethod
+    def marlin_dense_requested() -> bool:
+        vllm_config = get_current_vllm_config()
+        return (
+            dense_bits() == 4
+            and vllm_config.lora_config is None
+            and use_portable_kernels()
+        )
+
     def process_weights_after_loading(self) -> None:
         self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
+        if self.w4_checkpoint:
+            for proj in (self.qkvr, self.wo_ud):
+                finalize_packed_int4(proj)
+            return
         if int8_dense_enabled() and use_portable_kernels():
             # W8A16 projections: half the bytes of the bf16 GEMVs at decode.
             for proj in (self.qkvr, self.wo_ud):
