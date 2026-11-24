@@ -66,7 +66,11 @@ from .ops.int8_linear import (
     unpack_int8_rows,
 )
 from .ops.linear import linear
-from .ops.marlin_linear import prepare_marlin_w8
+from .ops.marlin_linear import (
+    finalize_packed_int4,
+    prepare_marlin_w8,
+    register_packed_int4,
+)
 from .ops.p2p_draft_norm import draft_norm_workspace, p2p_draft_norm
 
 
@@ -138,6 +142,13 @@ def all_reduce_add_rmsnorm(
     return x
 
 
+def _int4_projections(config: Inkling2DSparkConfig) -> bool:
+    """Whether the draft's projections are stored as compressed-tensors
+    `pack-quantized` symmetric int4 in groups of 128 (`int4_projections`
+    in the checkpoint's `mtp_config`), loaded into Marlin W4A16."""
+    return bool(getattr(config, "int4_projections", False))
+
+
 class Inkling2DraftSelfAttention(nn.Module):
     """Bidirectional block attention over context K/V (from target features)
     and the block itself; local layers see `sliding_window_size` positions
@@ -178,6 +189,10 @@ class Inkling2DraftSelfAttention(nn.Module):
             bias=False,
             prefix=f"{prefix}.o_proj",
         )
+        self.int4 = _int4_projections(config)
+        if self.int4:
+            for proj in (self.qkv_proj, self.kv_proj_ctx, self.o_proj):
+                register_packed_int4(proj)
         self.q_norm = _RMSNorm(self.head_dim, self.eps)
         self.k_norm = _RMSNorm(self.head_dim, self.eps)
         self.k_norm_ctx = _RMSNorm(self.head_dim, self.eps)
@@ -202,6 +217,11 @@ class Inkling2DraftSelfAttention(nn.Module):
             torch.arange(max_num_seqs + 1, dtype=torch.int32) * self.block,
             persistent=False,
         )
+
+    def process_weights_after_loading(self) -> None:
+        if self.int4:
+            for proj in (self.qkv_proj, self.kv_proj_ctx, self.o_proj):
+                finalize_packed_int4(proj)
 
     def _metadata(self) -> FlashAttentionMetadata | None:
         attn_metadata = get_forward_context().attn_metadata
@@ -314,6 +334,15 @@ class Inkling2DraftMLP(nn.Module):
             bias=False,
             prefix=f"{prefix}.down_proj",
         )
+        self.int4 = _int4_projections(config)
+        if self.int4:
+            for proj in (self.gate_up_proj, self.down_proj):
+                register_packed_int4(proj)
+
+    def process_weights_after_loading(self) -> None:
+        if self.int4:
+            for proj in (self.gate_up_proj, self.down_proj):
+                finalize_packed_int4(proj)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if collecting("draft"):
@@ -645,7 +674,9 @@ class Inkling2DSparkModel(nn.Module):
         assert self.lm_head is not None
         head = self.model.markov_head
         assert head.rnn_bias is not None
-        if os.getenv("VLLM_INKLING2_MARLIN_W8_DRAFT") == "1":
+        if os.getenv("VLLM_INKLING2_MARLIN_W8_DRAFT") == "1" and not _int4_projections(
+            self.config
+        ):
             for layer in self.model.layers:
                 for proj in (
                     layer.self_attn.qkv_proj,
@@ -785,6 +816,8 @@ class Inkling2DSparkModel(nn.Module):
         params = dict(self.named_parameters())
         loaded: set[str] = set()
         for name, weight in weights:
+            if name.endswith(".weight_shape"):
+                continue  # Metadata of the packed int4 projections.
             name, shard = f"model.{name}", None
             for old, new, shard_id in self._stacked:
                 if old in name:
