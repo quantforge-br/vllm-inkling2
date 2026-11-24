@@ -53,6 +53,7 @@ from .ops.dspark import (
     shard_reduce,
     silu_and_mul,
 )
+from .ops.gptq import COLLECTOR, collecting
 from .ops.int4_linear import is_packed_int4, unpack_int4_rows
 from .ops.int8_linear import (
     head_bits,
@@ -148,6 +149,7 @@ class Inkling2DraftSelfAttention(nn.Module):
         super().__init__()
         tp_size = get_tensor_model_parallel_world_size()
         assert tp_size <= config.num_key_value_heads
+        self.prefix = prefix
         hidden, self.head_dim = config.hidden_size, config.head_dim
         self.num_heads = config.num_attention_heads // tp_size
         self.num_kv_heads = config.num_key_value_heads // tp_size
@@ -216,6 +218,8 @@ class Inkling2DraftSelfAttention(nn.Module):
     def forward(
         self, positions: torch.Tensor, x: torch.Tensor, cos_sin_cache: torch.Tensor
     ) -> torch.Tensor:
+        if collecting("draft"):
+            COLLECTOR.add(f"{self.prefix}.qkv_proj.x", x)
         qkv = linear(
             x, getattr(self.qkv_proj.weight, "marlin_w8", self.qkv_proj.weight)
         )
@@ -268,6 +272,8 @@ class Inkling2DraftSelfAttention(nn.Module):
                 window=self.window,
                 num_splits=num_splits,
             )
+        if collecting("draft"):
+            COLLECTOR.add(f"{self.prefix}.o_proj.full", out, gather=True)
         return linear(out, getattr(self.o_proj.weight, "marlin_w8", self.o_proj.weight))
 
     def store_context_kv(
@@ -277,6 +283,8 @@ class Inkling2DraftSelfAttention(nn.Module):
         cos_sin_cache: torch.Tensor,
         slot_mapping: torch.Tensor | None,
     ) -> None:
+        if collecting("draft"):
+            COLLECTOR.add(f"{self.prefix}.kv_proj_ctx.x", context)
         k, v = linear(
             context,
             getattr(self.kv_proj_ctx.weight, "marlin_w8", self.kv_proj_ctx.weight),
@@ -293,6 +301,7 @@ class Inkling2DraftSelfAttention(nn.Module):
 class Inkling2DraftMLP(nn.Module):
     def __init__(self, config: Inkling2DSparkConfig, prefix: str) -> None:
         super().__init__()
+        self.prefix = prefix
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [config.intermediate_size] * 2,
@@ -307,6 +316,8 @@ class Inkling2DraftMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if collecting("draft"):
+            COLLECTOR.add(f"{self.prefix}.gate_up_proj.x", x)
         x = silu_and_mul(
             linear(
                 x,
@@ -315,6 +326,8 @@ class Inkling2DraftMLP(nn.Module):
                 ),
             )
         )
+        if collecting("draft"):
+            COLLECTOR.add(f"{self.prefix}.down_proj.full", x, gather=True)
         return linear(
             x, getattr(self.down_proj.weight, "marlin_w8", self.down_proj.weight)
         )
@@ -692,6 +705,8 @@ class Inkling2DSparkModel(nn.Module):
 
     def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """TP-local bf16 base logits (bf16 GEMM, as the reference)."""
+        if collecting("draft"):
+            COLLECTOR.add("draft.lm_head.x", hidden_states)
         weight = (
             self.draft_lm_head_weight
             if self.draft_lm_head_weight is not None

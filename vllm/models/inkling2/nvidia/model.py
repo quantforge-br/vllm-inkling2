@@ -78,6 +78,7 @@ from .ops.allreduce import Inkling2AllReduceWorkspace
 from .ops.attention import compute_log_scaling_tau
 from .ops.attn_res import attn_res
 from .ops.gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
+from .ops.gptq import COLLECTOR, collecting, collecting_layer_experts
 from .ops.int4_linear import int4_linear, is_packed_int4, pack_int4_rows
 from .ops.int8_linear import (
     head_bits,
@@ -805,6 +806,8 @@ class Inkling2ForConditionalGeneration(
         return self.model(positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        if collecting("head"):
+            COLLECTOR.add("lm_head.x", hidden_states)
         return self.logits_processor(self.lm_head, hidden_states)
 
     def compute_logits_shard(
@@ -840,6 +843,8 @@ class Inkling2ForConditionalGeneration(
         return rank_combine(tensor_model_parallel_all_reduce(packed))[0]
 
     def process_weights_after_loading(self) -> None:
+        if collecting("experts"):
+            self._reserve_expert_hessians()
         # W8A16 unembedding (not when tied to the input embedding).
         head = self.lm_head
         embed = getattr(self.model, "embed_tokens", None)
@@ -854,6 +859,24 @@ class Inkling2ForConditionalGeneration(
                 head.weight = nn.Parameter(pack(head.weight.data), requires_grad=False)
                 if bits == 8 and os.getenv("VLLM_INKLING2_MARLIN_W8_HEAD") == "1":
                     prepare_marlin_w8(head.weight, head.weight)
+
+    def _reserve_expert_hessians(self) -> None:
+        """Names the Humming experts of the collected layers (see
+        `ops.gptq`) and allocates their Hessians before the KV cache."""
+        for i, layer in enumerate(self.model.layers):
+            humming = getattr(layer.mlp.experts, "humming", None)
+            if humming is None or not collecting_layer_experts(i):
+                continue
+            name = f"model.layers.{i}.experts"
+            humming.hessian_name = name
+            device = humming.locks.device
+            for proj in ("w13", "w2"):
+                COLLECTOR.reserve_experts(
+                    f"{name}.{proj}",
+                    humming.num_experts,
+                    humming.configs[proj].shape_k,
+                    device,
+                )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())

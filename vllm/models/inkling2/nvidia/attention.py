@@ -60,7 +60,13 @@ from .ops.attention import (
     rel_decode_attention,
 )
 from .ops.attention_sm90 import MODE_OUT_LSE, rel_attention
-from .ops.gptq import COLLECTOR, collect_dir, hessian_dir, quantize_projection
+from .ops.gptq import (
+    COLLECTOR,
+    collect_full,
+    collecting,
+    hessian_dir,
+    quantize_projection,
+)
 from .ops.int8_linear import (
     int8_dense_enabled,
     int8_gemv_slices,
@@ -416,7 +422,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         # ``linear`` on the weight bypasses the layer (and a LoRA wrapper's
         # forward), so the LoRA deltas are added here (no-op without LoRA).
         weight = self.qkvr.weight
-        if collect_dir() is not None:
+        if collecting("attn"):
             if x_k is x_q and x_v is x_q:
                 COLLECTOR.add(f"{self.prefix}.qkvr.x", x_q)
             else:
@@ -517,8 +523,11 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             output,
             pass_idx,
         )
-        if collect_dir() is not None:
-            COLLECTOR.add(f"{self.prefix}.wo.x", output)
+        if collecting("attn"):
+            if collect_full():
+                COLLECTOR.add(f"{self.prefix}.wo.full", output, gather=True)
+            else:
+                COLLECTOR.add(f"{self.prefix}.wo.x", output)
         out = linear(output, self.wo_ud.weight, out)
         add_linear_lora(self.wo_ud, out, output)
         return out

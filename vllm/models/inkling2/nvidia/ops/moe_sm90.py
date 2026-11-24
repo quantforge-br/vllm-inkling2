@@ -599,11 +599,24 @@ class HummingExperts:
                 )[:3]
                 for size in set(block_m.values())
             }
+        # Set by the model only while GPTQ collects this layer's experts.
+        hessian_name = getattr(self, "hessian_name", None)
+        if hessian_name is not None:
+            from .gptq import COLLECTOR
+
+            COLLECTOR.add_experts(
+                f"{hessian_name}.w13", x, ids, weights, self.num_experts, False
+            )
         gate_up = self._gemm(
             "w13", x, rows, alignments[block_m["w13"]], topk, valid_rows
         )
         activated = swiglu(gate_up, weights, src2dst, gate_cap, up_cap)
         del gate_up
+        if hessian_name is not None:
+            # The rows already carry their routing weight.
+            COLLECTOR.add_experts(
+                f"{hessian_name}.w2", activated, ids, None, self.num_experts, True
+            )
         return self._gemm(
             "w2", activated, rows, alignments[block_m["w2"]], 1, valid_rows
         )

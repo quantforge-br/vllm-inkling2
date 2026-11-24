@@ -7,7 +7,14 @@ tensor-parallel layout:
 
 1. `VLLM_INKLING2_GPTQ_COLLECT=<dir>`: every eager (prefill) projection adds
    `x^T x` of its input to a per-layer, per-input fp32 Hessian; every
-   `_SAVE_EVERY` tokens each rank writes them to `<dir>`.
+   `VLLM_INKLING2_GPTQ_SAVE_EVERY` tokens (0: only when collection stops)
+   each rank writes them to `<dir>`. `VLLM_INKLING2_GPTQ_COLLECT_KINDS`
+   (comma-separated `attn`, `experts`, `head`, `draft`; default `attn`)
+   picks the projections, `VLLM_INKLING2_GPTQ_COLLECT_LAYERS` (e.g. `0-5,9`)
+   the decoder layers whose experts are collected (one `[E, K, K]` Hessian
+   per projection, each routed row weighted by its routing weight), and
+   `VLLM_INKLING2_GPTQ_COLLECT_FULL=1` gathers the inputs of row-parallel
+   projections so their Hessians span the unsharded input (`*.full`).
 2. `VLLM_INKLING2_GPTQ_DIR=<dir>` with `VLLM_INKLING2_DENSE_BITS=4`: at load
    time each projection with a saved Hessian is quantized by GPTQ (asymmetric
    uint4, groups of 128, no activation reordering) instead of
@@ -35,6 +42,53 @@ def hessian_dir() -> str | None:
     return os.environ.get("VLLM_INKLING2_GPTQ_DIR") or None
 
 
+_KINDS = frozenset({"attn", "experts", "head", "draft"})
+
+
+@functools.cache
+def collect_kinds() -> frozenset[str]:
+    if collect_dir() is None:
+        return frozenset()
+    spec = os.environ.get("VLLM_INKLING2_GPTQ_COLLECT_KINDS", "attn")
+    kinds = frozenset(k for k in spec.split(",") if k)
+    if kinds - _KINDS:
+        raise ValueError(
+            f"VLLM_INKLING2_GPTQ_COLLECT_KINDS: unknown {sorted(kinds - _KINDS)}"
+        )
+    return kinds
+
+
+def collecting(kind: str) -> bool:
+    return kind in collect_kinds()
+
+
+@functools.cache
+def collect_layers() -> frozenset[int] | None:
+    spec = os.environ.get("VLLM_INKLING2_GPTQ_COLLECT_LAYERS")
+    if not spec:
+        return None
+    layers: set[int] = set()
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        layers.update(range(int(lo), int(hi or lo) + 1))
+    return frozenset(layers)
+
+
+def collecting_layer_experts(layer: int) -> bool:
+    layers = collect_layers()
+    return collecting("experts") and (layers is None or layer in layers)
+
+
+@functools.cache
+def collect_full() -> bool:
+    return os.environ.get("VLLM_INKLING2_GPTQ_COLLECT_FULL") == "1"
+
+
+@functools.cache
+def save_every() -> int:
+    return int(os.environ.get("VLLM_INKLING2_GPTQ_SAVE_EVERY", str(_SAVE_EVERY)))
+
+
 def _path(root: str, name: str, rank: int) -> str:
     return os.path.join(root, f"rank{rank}", name.replace("/", "_") + ".pt")
 
@@ -42,30 +96,42 @@ def _path(root: str, name: str, rank: int) -> str:
 class _Collector:
     def __init__(self) -> None:
         self.hessians: dict[str, torch.Tensor] = {}
-        self.counts: dict[str, int] = {}
+        self.counts: dict[str, int | torch.Tensor] = {}
         self.tokens = 0
         self.saved_at = 0
         self.first: str | None = None
         self.active = False
 
-    def add(self, name: str, x: torch.Tensor) -> None:
-        if torch.cuda.is_current_stream_capturing() or x.shape[0] == 0:
-            return
+    def _gate(self, name: str, tokens: int) -> bool:
+        if torch.cuda.is_current_stream_capturing() or tokens == 0:
+            return False
         if self.first is None:
             self.first = name
         if name == self.first:
             # Only while `<dir>/ACTIVE` exists: keeps warmup batches out.
+            # Toggle it while the engine is idle, so every rank (and every
+            # collective below) agrees.
             root = collect_dir()
             assert root is not None
             was_active = self.active
             self.active = os.path.exists(os.path.join(root, "ACTIVE"))
             if self.active:
-                self.step(x.reshape(-1, x.shape[-1]).shape[0])
+                self.step(tokens)
             elif was_active:
                 self.save()  # final flush on the first call after `ACTIVE` goes
-        if not self.active:
+        return self.active
+
+    def add(self, name: str, x: torch.Tensor, gather: bool = False) -> None:
+        """Adds `x^T x` of the rows of `x` to `name`'s Hessian; with
+        `gather`, of the TP ranks' shards of `x`'s last dim, concatenated."""
+        x = x.reshape(-1, x.shape[-1])
+        if not self._gate(name, x.shape[0]):
             return
-        x = x.reshape(-1, x.shape[-1]).float()
+        if gather:
+            from vllm.distributed import tensor_model_parallel_all_gather
+
+            x = tensor_model_parallel_all_gather(x.contiguous(), dim=-1)
+        x = x.float()
         h = self.hessians.get(name)
         if h is None:
             h = self.hessians[name] = torch.zeros(
@@ -75,9 +141,62 @@ class _Collector:
         h.addmm_(x.t(), x)
         self.counts[name] += x.shape[0]
 
+    def reserve_experts(
+        self, name: str, num_experts: int, k: int, device: torch.device
+    ) -> None:
+        """Allocates `name`'s per-expert Hessians now (before the KV cache
+        takes the free memory)."""
+        if name not in self.hessians:
+            self.hessians[name] = torch.zeros(
+                (num_experts, k, k), dtype=torch.float32, device=device
+            )
+            self.counts[name] = torch.zeros(
+                num_experts, dtype=torch.int64, device=device
+            )
+
+    def add_experts(
+        self,
+        name: str,
+        x: torch.Tensor,
+        ids: torch.Tensor,
+        scale: torch.Tensor | None,
+        num_experts: int,
+        per_slot: bool,
+    ) -> None:
+        """Adds, per local expert, `x^T x` of the rows routed to it. `ids`
+        `[T, topk]` are local expert ids (-1: another rank's); `x` holds one
+        row per token (`[T, K]`) or per slot (`per_slot`, `[T * topk, K]`);
+        `scale` `[T * topk]` weights each slot's row."""
+        tokens, topk = ids.shape
+        if not self._gate(name, tokens):
+            return
+        self.reserve_experts(name, num_experts, x.shape[-1], x.device)
+        h = self.hessians[name]
+        counts = self.counts[name]
+        assert isinstance(counts, torch.Tensor)
+        flat = ids.reshape(-1)
+        slots = torch.nonzero(flat >= 0).squeeze(1)
+        if slots.numel() == 0:
+            return
+        experts = flat[slots].long()
+        rows = (x[slots] if per_slot else x[slots // topk]).float()
+        if scale is not None:
+            rows = rows * scale[slots].float().unsqueeze(1)
+        order = torch.argsort(experts, stable=True)
+        experts, rows = experts[order], rows[order]
+        per_expert = torch.bincount(experts, minlength=num_experts)
+        counts += per_expert
+        start = 0
+        for e, end in enumerate(per_expert.cumsum(0).tolist()):
+            if end > start:
+                block = rows[start:end]
+                h[e].addmm_(block.t(), block)
+            start = end
+
     def step(self, tokens: int) -> None:
         self.tokens += tokens
-        if self.tokens - self.saved_at < _SAVE_EVERY:
+        every = save_every()
+        if every <= 0 or self.tokens - self.saved_at < every:
             return
         self.saved_at = self.tokens
         self.save()
@@ -94,13 +213,19 @@ class _Collector:
         os.makedirs(os.path.join(root, f"rank{rank}"), exist_ok=True)
         for name, h in self.hessians.items():
             path = _path(root, name, rank)
+            count = self.counts[name]
             saved = {
                 "h": h.cpu(),
-                "n": self.counts[name],
+                "n": count.cpu() if isinstance(count, torch.Tensor) else count,
                 "tp_size": get_tensor_model_parallel_world_size(),
             }
+            if h.dim() == 3:
+                # Global id of the first local expert (experts are split
+                # evenly over the ranks).
+                saved["expert_start"] = rank * h.shape[0]
             torch.save(saved, path + ".tmp")
             os.replace(path + ".tmp", path)
+            del saved
 
 
 COLLECTOR = _Collector()
