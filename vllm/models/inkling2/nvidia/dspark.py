@@ -589,7 +589,10 @@ class Inkling2DSparkModel(nn.Module):
                     layer.mlp.gate_up_proj,
                     layer.mlp.down_proj,
                 ):
-                    prepare_marlin_w8(proj.weight, pack_int8_rows(proj.weight))
+                    prepare_marlin_w8(
+                        proj.weight,
+                        pack_int8_rows(proj.weight, scale_dtype=torch.bfloat16),
+                    )
         head.fold(self.lm_head.weight)
         head.rnn_bias.copy_(head.rnn_proj.bias)
         self.model.fuse_alpha.copy_(

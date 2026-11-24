@@ -44,14 +44,22 @@ def is_packed_int8(weight: torch.Tensor) -> bool:
     return weight.dtype == torch.int8
 
 
-def pack_int8_rows(weight: torch.Tensor) -> torch.Tensor:
-    """Per-output-row symmetric int8 codes of `weight` `[N, K]`, packed with
-    their fp32 scales as `[N, K + ROW_PAD]`."""
+def pack_int8_rows(
+    weight: torch.Tensor, scale_dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """Pack symmetric int8 rows with a selectable scale precision.
+
+    Marlin stores row scales as BF16. Its codes therefore need to be rounded
+    against BF16-rounded scales before repacking, rather than against FP32
+    scales that are truncated only after the codes were selected.
+    """
     n, k = weight.shape
     assert k % 16 == 0
     w = weight.float()
     amax = w.abs().amax(dim=1, keepdim=True)
     scale = torch.where(amax > 0, amax / 127.0, torch.ones_like(amax))
+    if scale_dtype != torch.float32:
+        scale = scale.to(scale_dtype).float()
     codes = torch.round(w / scale).clamp_(-127, 127).to(torch.int8)
     packed = torch.zeros((n, k + ROW_PAD), dtype=torch.int8, device=weight.device)
     packed[:, :k] = codes
