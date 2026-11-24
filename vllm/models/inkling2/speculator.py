@@ -55,8 +55,7 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                 # Async scheduling fixes the next step's rows with placeholders
                 # before the drafts exist.
                 raise ValueError(
-                    "VLLM_INKLING2_DSPARK_MIN_CONFIDENCE requires "
-                    "--no-async-scheduling"
+                    "VLLM_INKLING2_DSPARK_MIN_CONFIDENCE requires --no-async-scheduling"
                 )
             assert vllm_config.speculative_config is not None
             if vllm_config.speculative_config.draft_sample_method != "greedy":
@@ -90,6 +89,14 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
         self, target_model: nn.Module, target_attn_layer_names: set[str]
     ) -> nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
+        if (
+            getattr(model, "draft_vocab_ids", None) is not None
+            and self.draft_logits is not None
+        ):
+            raise ValueError(
+                "VLLM_INKLING2_DRAFT_VOCAB_PATH requires replicated greedy "
+                "DSpark sampling"
+            )
         model.attach_target(target_model.get_language_model())
         return model
 
@@ -129,9 +136,11 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                 prefix_len = prefix_len + (prefix_prob >= self.min_prefix_confidence)
             elif self.draft_logits is None:
                 prev = self.model.markov_argmax(base_logits[:, i], bias)
+                prev = self.model.map_draft_to_target(prev)
             else:
                 logits = self.model.markov_logits(base_logits[:, i], bias)
                 prev = self._sample_logits(logits, idx_map[:, i], sample_pos[:, i], i)
+            prev = self.model.map_draft_to_target(prev)
             self.draft_tokens[:num_reqs, i] = prev
         if prefix_len is not None:
             assert self.draft_prefix_lens is not None

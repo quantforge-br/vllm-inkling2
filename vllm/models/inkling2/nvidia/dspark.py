@@ -7,6 +7,7 @@ implementation's draft (flashinfer RMSNorms, bf16 logits)."""
 
 import os
 from collections.abc import Iterable
+from pathlib import Path
 from typing import cast
 
 import torch
@@ -549,6 +550,37 @@ class Inkling2DSparkModel(nn.Module):
             config, vllm_config.model_config.max_model_len, f"{prefix}model"
         )
         self.lm_head: nn.Module | None = None
+        self.draft_lm_head_weight: torch.Tensor | None = None
+        vocab_path = os.environ.get("VLLM_INKLING2_DRAFT_VOCAB_PATH")
+        if vocab_path:
+            path = Path(vocab_path)
+            if path.is_dir():
+                path = path / "draft_vocab_ids.pt"
+            if not path.is_file():
+                raise FileNotFoundError(f"draft vocabulary artifact not found: {path}")
+            ids = torch.load(path, map_location="cpu", weights_only=True)
+            if not isinstance(ids, torch.Tensor) or ids.dtype not in (
+                torch.int32,
+                torch.int64,
+            ):
+                raise ValueError(
+                    "draft_vocab_ids.pt must contain an int32 or int64 tensor"
+                )
+            ids = ids.to(torch.int64).flatten()
+            tp = get_tensor_model_parallel_world_size()
+            if ids.numel() == 0 or ids.numel() % tp:
+                raise ValueError(
+                    "draft vocabulary size must be non-zero and divisible by TP size"
+                )
+            if not torch.equal(ids, torch.unique(ids, sorted=True)):
+                raise ValueError("draft vocabulary ids must be sorted and unique")
+            if ids[-1].item() >= config.vocab_size or ids[0].item() < 0:
+                raise ValueError(
+                    "draft vocabulary ids are outside the target vocabulary"
+                )
+            self.register_buffer("draft_vocab_ids", ids, persistent=False)
+        else:
+            self.draft_vocab_ids = None
 
     @torch.no_grad()
     def attach_target(self, target_model: nn.Module) -> None:
@@ -570,6 +602,26 @@ class Inkling2DSparkModel(nn.Module):
         self.model.norm.p2p_workspace = norm_workspace
         head = self.model.markov_head
         head.rnn_bias = torch.empty_like(head.rnn_proj.bias, dtype=torch.float32)
+        if self.draft_vocab_ids is not None:
+            tp = get_tensor_model_parallel_world_size()
+            rank = get_tensor_model_parallel_rank()
+            weight = self.lm_head.weight
+            target_shard = weight.shape[0]
+            target_ids = self.draft_vocab_ids.to(weight.device)
+            self.draft_vocab_ids = target_ids
+            local_ids = (
+                target_ids[
+                    (target_ids >= rank * target_shard)
+                    & (target_ids < (rank + 1) * target_shard)
+                ]
+                - rank * target_shard
+            )
+            expected = self.draft_vocab_ids.numel() // tp
+            if local_ids.numel() != expected:
+                raise ValueError(
+                    "draft vocabulary must contain equal rows in every TP shard"
+                )
+            self.draft_lm_head_weight = weight.index_select(0, local_ids)
         self.refresh_derived_weights()
 
     @torch.no_grad()
@@ -593,7 +645,12 @@ class Inkling2DSparkModel(nn.Module):
                         proj.weight,
                         pack_int8_rows(proj.weight, scale_dtype=torch.bfloat16),
                     )
-        head.fold(self.lm_head.weight)
+        fold_weight = (
+            self.draft_lm_head_weight
+            if self.draft_lm_head_weight is not None
+            else self.lm_head.weight
+        )
+        head.fold(fold_weight)
         head.rnn_bias.copy_(head.rnn_proj.bias)
         self.model.fuse_alpha.copy_(
             torch.softmax(self.model.fuse_weight.float(), dim=-1)
@@ -635,8 +692,13 @@ class Inkling2DSparkModel(nn.Module):
 
     def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """TP-local bf16 base logits (bf16 GEMM, as the reference)."""
-        assert self.lm_head is not None
-        return linear(hidden_states, self.lm_head.weight)
+        weight = (
+            self.draft_lm_head_weight
+            if self.draft_lm_head_weight is not None
+            else self.lm_head.weight
+        )
+        assert weight is not None
+        return linear(hidden_states, weight)
 
     def markov_step(
         self, state: torch.Tensor, prev_tokens: torch.Tensor, context: torch.Tensor
@@ -663,12 +725,17 @@ class Inkling2DSparkModel(nn.Module):
         rank = get_tensor_model_parallel_rank()
         shard = base_logits.shape[1]
         start = rank * shard
+        vocab_size = (
+            self.draft_vocab_ids.numel()
+            if self.draft_vocab_ids is not None
+            else self.config.vocab_size
+        )
         packed = shard_reduce(
             base_logits,
             bias,
             self.config.final_logit_softcapping,
             start,
-            self.config.vocab_size - start,
+            vocab_size - start,
             rank,
             tp,
         )
@@ -695,7 +762,9 @@ class Inkling2DSparkModel(nn.Module):
         return tokens, torch.exp(top - torch.logsumexp(logits, dim=-1))
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
-        return draft_ids
+        if self.draft_vocab_ids is None:
+            return draft_ids
+        return self.draft_vocab_ids[draft_ids]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
