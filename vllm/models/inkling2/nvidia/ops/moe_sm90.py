@@ -37,6 +37,12 @@ _SM8X_SMALL_BATCH_TUNING = {
     "warp_shape": [8, 64, 64],
     "num_ctas_per_sm": 3,
 }
+_SM86_TWO_TOKEN_TUNING = {
+    "block_shape": [8, 64, 64],
+    "warp_shape": [8, 32, 32],
+    "num_stages": 3,
+    "num_ctas_per_sm": 4,
+}
 
 
 @functools.cache
@@ -404,6 +410,7 @@ class HummingExperts:
     ) -> None:
         from vllm.utils.humming import (
             BaseWeightSchema,
+            CompressedTensorsWeightSchema,
             GemmType,
             HummingInputSchema,
             ModeloptMxfp8WeightSchema,
@@ -465,9 +472,22 @@ class HummingExperts:
                 # rows): narrower N tiles on three CTAs per SM are 0.7% of a
                 # verify step faster than the heuristic's (8, 256, 128) on
                 # RTX 3090, with the same accumulation order.
-                for lower, _, kernel_config in tuning:
+                for lower, upper, kernel_config in tuning:
                     if lower == 16:
                         kernel_config.update(_SM8X_SMALL_BATCH_TUNING)
+                    elif (
+                        (lower, upper) == (4, 8)
+                        and os.getenv("VLLM_INKLING2_HUMMING_TWO_TOKEN") == "1"
+                        and torch.cuda.get_device_capability(weight.device) == (8, 6)
+                        and num_experts == 64
+                        and (n, k) in ((2304, 2304), (2304, 1152))
+                        and isinstance(source, CompressedTensorsWeightSchema)
+                        and source.type == "int"
+                        and source.num_bits == 4
+                        and source.group_size == 128
+                        and not source.symmetric
+                    ):
+                        kernel_config.update(_SM86_TWO_TOKEN_TUNING)
             self.configs[name] = config
             self.tensors[name] = tensors
             self.tunings[name] = tuning
