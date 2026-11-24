@@ -22,6 +22,13 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 from vllm.scalar_type import scalar_types
 from vllm.triton_utils import triton
 
+from .w4a8_linear import (
+    prefill_int8_act_enabled,
+    prefill_int8_min_m,
+    prepare_w4a8,
+    w4a8_linear,
+)
+
 GROUP = 128
 _N_ALIGN = 64
 _QTYPE = scalar_types.uint4
@@ -179,6 +186,9 @@ def pack_marlin_w4_sym(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     ).to(codes.device)
     q.marlin_zero = None
     q.marlin_type = scalar_types.uint4b8
+    if prefill_int8_act_enabled():
+        # The prefill W4A8-INT8 copy (unpadded rows).
+        q.w4a8_weight, q.w4a8_scale = prepare_w4a8(codes[:n], scale[:n])
     return q
 
 
@@ -195,6 +205,20 @@ def marlin_linear(
     lead = x.shape[:-1]
     x2 = x.reshape(-1, k)
     m = x2.shape[0]
+    w4a8 = getattr(weight, "w4a8_weight", None)
+    if w4a8 is not None and m >= prefill_int8_min_m():
+        y = w4a8_linear(
+            x2,
+            w4a8,
+            weight.w4a8_scale,
+            out if out is not None and out.dtype == x.dtype else None,
+        )
+        if out is not None and y.data_ptr() != out.data_ptr():
+            out.copy_(y)
+            return out.view(*lead, n)
+        if out_dtype is not None and out_dtype != y.dtype:
+            y = y.to(out_dtype)
+        return y.view(*lead, n)
     direct = out is not None and size_n == n and out.is_contiguous()
     if out is not None:
         assert out.shape == (m, n)
@@ -231,7 +255,15 @@ def marlin_linear(
     return y.reshape(*lead, n)
 
 
-_ATTRS = ("marlin_n", "marlin_k", "marlin_scale", "marlin_zero", "marlin_type")
+_ATTRS = (
+    "marlin_n",
+    "marlin_k",
+    "marlin_scale",
+    "marlin_zero",
+    "marlin_type",
+    "w4a8_weight",
+    "w4a8_scale",
+)
 
 
 def marlin_parameter(
