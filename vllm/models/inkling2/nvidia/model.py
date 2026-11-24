@@ -856,9 +856,18 @@ class Inkling2ForConditionalGeneration(
             # GEMV where W4A16 beats W8A16 on SM86.
             bits = head_bits()
             if bits < 16:
-                pack = pack_int4_rows if bits == 4 else pack_int8_rows
-                head.weight = nn.Parameter(pack(head.weight.data), requires_grad=False)
-                if bits == 8 and os.getenv("VLLM_INKLING2_MARLIN_W8_HEAD") == "1":
+                marlin = bits == 8 and os.getenv("VLLM_INKLING2_MARLIN_W8_HEAD") == "1"
+                if bits == 4:
+                    packed = pack_int4_rows(head.weight.data)
+                else:
+                    # Marlin keeps bf16 row scales: round the codes against
+                    # them, so its rows equal the Triton GEMV's.
+                    packed = pack_int8_rows(
+                        head.weight.data,
+                        scale_dtype=torch.bfloat16 if marlin else torch.float32,
+                    )
+                head.weight = nn.Parameter(packed, requires_grad=False)
+                if marlin:
                     prepare_marlin_w8(head.weight, head.weight)
         if embed_int8_enabled() and embed is not None and not tied:
             make_embedding_int8(embed)
