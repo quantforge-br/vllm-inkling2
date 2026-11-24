@@ -5,6 +5,7 @@ through a small dense transformer over DFlare-mixed target-feature K/V, then a
 recurrent (`rnn_hidden`) Markov head. Numerics follow the reference
 implementation's draft (flashinfer RMSNorms, bf16 logits)."""
 
+import io
 import os
 from collections.abc import Iterable
 from pathlib import Path
@@ -31,6 +32,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -140,6 +142,49 @@ def all_reduce_add_rmsnorm(
         pattern_code=flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
     )
     return x
+
+
+DRAFT_VOCAB_FILE = "draft_vocab_ids.pt"
+
+
+def _load_draft_vocab(
+    vllm_config: VllmConfig, config: Inkling2DSparkConfig
+) -> object | None:
+    """The pruned draft vocabulary (target token ids the draft head predicts).
+
+    `VLLM_INKLING2_DRAFT_VOCAB_PATH` (a `draft_vocab_ids.pt` file or its
+    directory) wins; otherwise a checkpoint whose `mtp_config` sets
+    `pruned_vocab_size` ships the file next to its weights (local directory or
+    Hugging Face repository). Returns `None` for the full vocabulary.
+
+    The key is not the generic `draft_vocab_size`: the draft keeps sharing the
+    full target head and selects these rows from it, while vLLM reads
+    `draft_vocab_size` as a draft head of its own and stops sharing."""
+    vocab_path = os.environ.get("VLLM_INKLING2_DRAFT_VOCAB_PATH")
+    if vocab_path:
+        path = Path(vocab_path)
+        if path.is_dir():
+            path = path / DRAFT_VOCAB_FILE
+        if not path.is_file():
+            raise FileNotFoundError(f"draft vocabulary artifact not found: {path}")
+        return torch.load(path, map_location="cpu", weights_only=True)
+    size = getattr(config, "pruned_vocab_size", None)
+    if not size:
+        return None
+    draft = vllm_config.speculative_config.draft_model_config
+    data = get_hf_file_bytes(DRAFT_VOCAB_FILE, draft.model, draft.revision)
+    if data is None:
+        raise FileNotFoundError(
+            f"mtp_config sets pruned_vocab_size but {draft.model} has no "
+            f"{DRAFT_VOCAB_FILE}"
+        )
+    ids = torch.load(io.BytesIO(data), map_location="cpu", weights_only=True)
+    if not isinstance(ids, torch.Tensor) or ids.numel() != size:
+        raise ValueError(
+            f"{DRAFT_VOCAB_FILE} does not hold the pruned_vocab_size={size} "
+            "ids the mtp_config declares"
+        )
+    return ids
 
 
 def _int4_projections(config: Inkling2DSparkConfig) -> bool:
@@ -593,14 +638,8 @@ class Inkling2DSparkModel(nn.Module):
         )
         self.lm_head: nn.Module | None = None
         self.draft_lm_head_weight: torch.Tensor | None = None
-        vocab_path = os.environ.get("VLLM_INKLING2_DRAFT_VOCAB_PATH")
-        if vocab_path:
-            path = Path(vocab_path)
-            if path.is_dir():
-                path = path / "draft_vocab_ids.pt"
-            if not path.is_file():
-                raise FileNotFoundError(f"draft vocabulary artifact not found: {path}")
-            ids = torch.load(path, map_location="cpu", weights_only=True)
+        ids = _load_draft_vocab(vllm_config, config)
+        if ids is not None:
             if not isinstance(ids, torch.Tensor) or ids.dtype not in (
                 torch.int32,
                 torch.int64,
