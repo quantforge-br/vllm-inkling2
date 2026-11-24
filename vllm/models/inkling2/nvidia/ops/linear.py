@@ -142,9 +142,14 @@ def _k_group_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     SPLIT: tl.constexpr,
+    PREFETCH: tl.constexpr = True,
 ):
-    if SPLIT and tl.program_id(1) == 0:
-        _prefetch_k_group_tile(W, N, K, BN, tl.program_id(0), tl.program_id(2))
+    if PREFETCH and tl.program_id(1) == 0:
+        if SPLIT:
+            _prefetch_k_group_tile(W, N, K, BN, tl.program_id(0), tl.program_id(2))
+        else:
+            for group in tl.static_range(triton.cdiv(K, 1024)):
+                _prefetch_k_group_tile(W, N, K, BN, tl.program_id(0), group)
     gdc_wait()
     _k_group_tile(
         X,
@@ -278,6 +283,7 @@ def k_group_partials(
         block_m,
         block_n,
         split,
+        PREFETCH=split,
         num_warps=num_warps,
         num_stages=num_stages,
         enable_fp_fusion=False,

@@ -524,3 +524,92 @@ def test_gate_sink(num_tokens):
     expected = output.view(num_tokens, -1) * torch.sigmoid(gate.float()) * scale
     assert actual.dtype == torch.bfloat16
     torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    _cap is None or (_cap.major, _cap.minor) != (8, 6),
+    reason="Coverage for the SM86 int8 per-token-head decode path",
+)
+@pytest.mark.parametrize("query_len", range(1, 9))
+@pytest.mark.parametrize("splits", (1, 3))
+@torch.inference_mode()
+def test_sm86_full_attention_skips_old_int8_bias(monkeypatch, query_len, splits):
+    from vllm.models.inkling2.nvidia.ops.attention_sm90 import (
+        MODE_PARTIAL,
+        _skip_old_bias,
+        rel_attention,
+    )
+
+    torch.manual_seed(42)
+    heads, kv_heads, page, dim = 12, 4, 16, 128
+    q = torch.randn(query_len, heads, dim, device="cuda", dtype=torch.bfloat16)
+    # Same head stride, int8 codes and embedded FP32 scales as the runtime.
+    packed = torch.empty(
+        (80, page, kv_heads, 2 * dim + 8), dtype=torch.int8, device="cuda"
+    )
+    packed[..., : 2 * dim].random_(-127, 128)
+    packed[..., 2 * dim :].view(torch.float32).uniform_(0.001, 0.03)
+    k, v = packed[..., :dim], packed[..., dim : 2 * dim]
+    table = torch.randperm(80, device="cuda").view(1, -1).int()
+    lengths = torch.empty(1, device="cuda", dtype=torch.int32)
+    cu = torch.tensor([0, query_len], device="cuda", dtype=torch.int32)
+    rel = torch.randn(query_len, heads, REL_EXTENT, device="cuda").bfloat16()
+    sheared_buffer = torch.empty(
+        (query_len + 128, heads, REL_EXTENT + 256), device="cuda", dtype=q.dtype
+    )
+
+    def allocate():
+        return (
+            torch.empty(splits, *q.shape, device="cuda"),
+            torch.empty(splits, query_len, heads, device="cuda"),
+        )
+
+    def launch(outputs, window):
+        rel_attention(
+            q,
+            k,
+            v,
+            *outputs,
+            sheared_buffer,
+            block_table=table,
+            cache_seqlens=lengths,
+            cu_seqlens_q=cu,
+            max_query_len=query_len,
+            softmax_scale=dim**-0.5,
+            window=window,
+            num_splits=splits,
+            mode=MODE_PARTIAL,
+        )
+
+    def set_boundary(distance, window):
+        kv_len = 127 + distance + query_len
+        lengths.fill_(kv_len)
+        sheared_buffer.copy_(
+            shear_rel_logits(rel, [(query_len, kv_len)], 128, bool(window))
+        )
+
+    try:
+        for window in (0, 1024):
+            actual, ref = allocate(), allocate()
+            monkeypatch.setenv("VLLM_INKLING2_ATTN_SKIP_OLD_BIAS", "1")
+            _skip_old_bias.cache_clear()
+            set_boundary(1024, window)
+            launch(actual, window)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch(actual, window)
+            for distance in (1023, 1024, 1025):
+                set_boundary(distance, window)
+                monkeypatch.setenv("VLLM_INKLING2_ATTN_SKIP_OLD_BIAS", "0")
+                _skip_old_bias.cache_clear()
+                launch(ref, window)
+                monkeypatch.setenv("VLLM_INKLING2_ATTN_SKIP_OLD_BIAS", "1")
+                _skip_old_bias.cache_clear()
+                launch(actual, window)
+                for got, want in zip(actual, ref, strict=True):
+                    torch.testing.assert_close(got, want, rtol=0, atol=0)
+                graph.replay()
+                for got, want in zip(actual, ref, strict=True):
+                    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    finally:
+        _skip_old_bias.cache_clear()

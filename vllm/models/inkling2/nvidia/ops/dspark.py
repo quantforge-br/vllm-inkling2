@@ -317,7 +317,10 @@ def _shard_reduce_finish_kernel(
     for r in tl.static_range(TP):
         own = r == rank
         tl.store(PACKED + r * rows + row, tl.where(own, m, 0.0))
-        tl.store(PACKED + (TP + r) * rows + row, tl.where(own, (first + start).to(tl.float32), 0.0))
+        tl.store(
+            PACKED + (TP + r) * rows + row,
+            tl.where(own, (first + start).to(tl.float32), 0.0),
+        )
         tl.store(PACKED + (2 * TP + r) * rows + row, tl.where(own, lse, 0.0))
 
 
@@ -345,8 +348,9 @@ def shard_reduce(
     rank: int, tp: int,
 ) -> torch.Tensor:
     """PACKED [4, tp, rows] fp32 (the 4th slot is zero padding that keeps
-    the tensor a multiple of 16 bytes for the custom all-reduce) for `add_softcap(a, b)` of this rank's
-    vocabulary shard (columns at or past `n_valid` ignored): its row max,
+    the tensor a multiple of 16 bytes for the custom all-reduce) for
+    `add_softcap(a, b)` of this rank's vocabulary shard (columns at or past
+    `n_valid` ignored): its row max,
     global index of the first max and logsumexp in slot `rank`, zeros in the
     other slots, ready for an all-reduce sum."""
     rows, n = a.shape

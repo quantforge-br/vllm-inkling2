@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -131,6 +131,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         # as the copy operations are performed on a different CUDA stream than
         # the one where the tensors were created.
         self.model_runner_output = model_runner_output
+        self.output_observer: Callable[[ModelRunnerOutput], None] | None = None
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.pending_aux_output = pending_aux_output
@@ -239,6 +240,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 f"Mask: {mask.cpu().tolist()}"
             )
 
+        if self.output_observer is not None:
+            self.output_observer(self.model_runner_output)
         return self.model_runner_output
 
     def get_kv_connector_output(self) -> KVConnectorOutput | None:

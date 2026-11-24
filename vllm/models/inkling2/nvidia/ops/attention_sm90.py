@@ -14,6 +14,9 @@ of the rows' visible range, so a split count that depends only on the batch
 holds for every replay of a CUDA graph.
 """
 
+import functools
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -56,6 +59,34 @@ def _load_fp8_kv(ptr, offsets, mask, dtype: tl.constexpr, D: tl.constexpr):
     return tl.interleave(lo, hi).to(dtype)
 
 
+@functools.cache
+def _skip_old_bias() -> bool:
+    return os.getenv("VLLM_INKLING2_ATTN_SKIP_OLD_BIAS", "0") == "1"
+
+
+@triton.jit
+def _relative_scores(
+    score,
+    pos,
+    keys,
+    key_valid,
+    row_valid,
+    rel_row,
+    WINDOW: tl.constexpr,
+    DRAFT: tl.constexpr,
+    E: tl.constexpr,
+):
+    dist = pos[:, None] - keys[None, :]
+    visible = (dist >= 0) & key_valid[None, :]
+    if WINDOW > 0:
+        visible &= dist < WINDOW
+    if not DRAFT:
+        in_extent = visible & (dist < E) & row_valid[:, None]
+        bias = tl.load(rel_row[:, None] + keys[None, :], mask=in_extent, other=0.0)
+        score = tl.fma(bias.to(tl.float32), 1.4426950408889634, score)
+    return tl.where(visible, score, float("-inf"))
+
+
 @triton.jit
 def _rel_attention_kernel(
     Q,
@@ -92,6 +123,7 @@ def _rel_attention_kernel(
     PAGE: tl.constexpr,
     WINDOW: tl.constexpr,
     DRAFT: tl.constexpr,
+    SKIP_OLD_BIAS: tl.constexpr,
     MODE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -139,6 +171,7 @@ def _rel_attention_kernel(
         mask=row_valid[:, None],
         other=0.0,
     )
+    rel_row = Rel + tl.zeros((BLOCK_M,), tl.int64)
     if not DRAFT:
         tile_end = tl.minimum((tok // _SHEAR_TILE + 1) * _SHEAR_TILE, q_len)
         rel_base = (past + tile_end + 127) // 128 * 128 - E_PAD
@@ -184,15 +217,18 @@ def _rel_attention_kernel(
                     other=0.0,
                 ).to(q.dtype)
             s = tl.dot(q, k) * qk_scale
-        dist = pos[:, None] - keys[None, :]
-        visible = (dist >= 0) & key_valid[None, :]
-        if WINDOW > 0:
-            visible &= dist < WINDOW
-        if not DRAFT:
-            in_extent = visible & (dist < E) & row_valid[:, None]
-            bias = tl.load(rel_row[:, None] + keys[None, :], mask=in_extent, other=0.0)
-            s += bias.to(tl.float32) * LOG2E
-        s = tl.where(visible, s, float("-inf"))
+        if SKIP_OLD_BIAS:
+            # Even the newest key in this block predates the relative extent
+            # of the earliest valid query. Keep the split's online sum order.
+            last_key = (n + 1) * BLOCK_N - 1
+            if last_key >= seqlen_k or last_key > pos_lo - E:
+                s = _relative_scores(
+                    s, pos, keys, key_valid, row_valid, rel_row, WINDOW, DRAFT, E
+                )
+        else:
+            s = _relative_scores(
+                s, pos, keys, key_valid, row_valid, rel_row, WINDOW, DRAFT, E
+            )
         m_new = tl.maximum(m_i, tl.max(s, 1))
         m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
         alpha = tl.exp2(m_i - m_safe)
@@ -367,6 +403,14 @@ def rel_attention(
         PAGE=page,
         WINDOW=window,
         DRAFT=draft,
+        SKIP_OLD_BIAS=(
+            not draft
+            and window == 0
+            and mode != MODE_OUT_LSE
+            and max_query_len <= 8
+            and key_cache.dtype == torch.int8
+            and _skip_old_bias()
+        ),
         MODE=mode,
         BLOCK_M=block_m,
         BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,

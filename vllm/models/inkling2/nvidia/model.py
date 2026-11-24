@@ -10,6 +10,7 @@ running partial block. Residual blocks are stored in bf16; mixes are fp32.
 Looped checkpoints (`loop_config`) are `Inkling2LoopModel` (`loop.py`).
 """
 
+import os
 from collections import Counter
 from collections.abc import Callable, Hashable, Iterable, Sequence
 from typing import Any
@@ -85,6 +86,7 @@ from .ops.int8_linear import (
     is_packed_int8,
     pack_int8_rows,
 )
+from .ops.marlin_linear import prepare_marlin_w8
 from .ops.moe import combine as moe_combine
 from .ops.norm import rms_norm
 from .ops.p2p_conv import p2p_conv_enabled
@@ -849,9 +851,9 @@ class Inkling2ForConditionalGeneration(
             bits = head_bits()
             if bits < 16:
                 pack = pack_int4_rows if bits == 4 else pack_int8_rows
-                head.weight = nn.Parameter(
-                    pack(head.weight.data), requires_grad=False
-                )
+                head.weight = nn.Parameter(pack(head.weight.data), requires_grad=False)
+                if bits == 8 and os.getenv("VLLM_INKLING2_MARLIN_W8_HEAD") == "1":
+                    prepare_marlin_w8(head.weight, head.weight)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())

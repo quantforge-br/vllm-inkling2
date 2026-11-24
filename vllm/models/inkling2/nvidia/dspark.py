@@ -40,28 +40,32 @@ from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
 
 from ..configs import Inkling2DSparkConfig
 from ..speculator_config import Inkling2DSparkSpeculatorConfig
+from .ops import use_portable_kernels
 from .ops.attention import block_decode_attention, plan_decode_attention
 from .ops.dspark import (
     add_softcap,
-    rank_combine,
-    shard_reduce,
     markov_gate,
     mix_rmsnorm,
     qk_norm_rope_,
+    rank_combine,
     rope_,
+    shard_reduce,
     silu_and_mul,
 )
 from .ops.int4_linear import is_packed_int4, unpack_int4_rows
-from .ops import use_portable_kernels
 from .ops.int8_linear import (
     head_bits,
     int8_dense_enabled,
     int8_linear,
     is_packed_int8,
+    markov_m1_enabled,
+    markov_m1_int8,
     pack_int8_rows,
     unpack_int8_rows,
 )
 from .ops.linear import linear
+from .ops.marlin_linear import prepare_marlin_w8
+from .ops.p2p_draft_norm import draft_norm_workspace, p2p_draft_norm
 
 
 class _RMSNorm(nn.Module):
@@ -69,6 +73,7 @@ class _RMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size), requires_grad=False)
         self.eps = eps
+        self.p2p_workspace = None
 
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
@@ -92,6 +97,8 @@ def all_reduce_add_rmsnorm(
     same rank-order fp32 sum, rounded once to bf16); the norm then reads the
     bf16 residual. Others all-reduce, then add and normalize.
     """
+    if norm.p2p_workspace is not None and norm.p2p_workspace.usable(*x.shape):
+        return p2p_draft_norm(x, residual, norm.weight, norm.eps, norm.p2p_workspace)
     fi_ar = getattr(get_tp_group().device_communicator, "fi_ar_comm", None)
     if fi_ar is None or not fi_ar.should_use_fi_ar(x):
         return norm(tensor_model_parallel_all_reduce(x), residual)
@@ -208,7 +215,9 @@ class Inkling2DraftSelfAttention(nn.Module):
     def forward(
         self, positions: torch.Tensor, x: torch.Tensor, cos_sin_cache: torch.Tensor
     ) -> torch.Tensor:
-        qkv = linear(x, self.qkv_proj.weight)
+        qkv = linear(
+            x, getattr(self.qkv_proj.weight, "marlin_w8", self.qkv_proj.weight)
+        )
         qk_norm_rope_(
             qkv,
             positions,
@@ -258,7 +267,7 @@ class Inkling2DraftSelfAttention(nn.Module):
                 window=self.window,
                 num_splits=num_splits,
             )
-        return linear(out, self.o_proj.weight)
+        return linear(out, getattr(self.o_proj.weight, "marlin_w8", self.o_proj.weight))
 
     def store_context_kv(
         self,
@@ -267,9 +276,10 @@ class Inkling2DraftSelfAttention(nn.Module):
         cos_sin_cache: torch.Tensor,
         slot_mapping: torch.Tensor | None,
     ) -> None:
-        k, v = linear(context, self.kv_proj_ctx.weight).split(
-            [self.kv_size, self.kv_size], -1
-        )
+        k, v = linear(
+            context,
+            getattr(self.kv_proj_ctx.weight, "marlin_w8", self.kv_proj_ctx.weight),
+        ).split([self.kv_size, self.kv_size], -1)
         k = self.k_norm_ctx(k.reshape(-1, self.head_dim))
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         rope_(k, positions, cos_sin_cache)
@@ -296,8 +306,17 @@ class Inkling2DraftMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = silu_and_mul(linear(x, self.gate_up_proj.weight))
-        return linear(x, self.down_proj.weight)
+        x = silu_and_mul(
+            linear(
+                x,
+                getattr(
+                    self.gate_up_proj.weight, "marlin_w8", self.gate_up_proj.weight
+                ),
+            )
+        )
+        return linear(
+            x, getattr(self.down_proj.weight, "marlin_w8", self.down_proj.weight)
+        )
 
 
 class Inkling2DraftLayer(nn.Module):
@@ -379,7 +398,13 @@ class Inkling2MarkovHead(nn.Module):
             if is_packed_int4(head):
                 head = unpack_int4_rows(head, projection.shape[0])
             elif is_packed_int8(head):
-                head = unpack_int8_rows(head)
+                if hasattr(lm_head_weight, "marlin_row_scales"):
+                    head = (
+                        head[:, : projection.shape[0]].float()
+                        * lm_head_weight.marlin_row_scales[rows]
+                    )
+                else:
+                    head = unpack_int8_rows(head)
             head = head.double()
             self.fold_weight[rows].copy_(head @ projection)
             self.fold_bias[rows].copy_(head @ bias)
@@ -414,8 +439,11 @@ class Inkling2MarkovHead(nn.Module):
         raw = torch.addmm(context, inputs, weight.T, out_dtype=torch.float32)
         state, latent = markov_gate(raw, state)
         if self.fold_packed is not None and latent.shape[0] <= 16:
-            # One GEMV at half the bytes of the bf16 GEMM per drafted token.
-            return state, int8_linear(latent, self.fold_packed).add_(self.fold_bias)
+            if latent.shape == (1, 256) and markov_m1_enabled():
+                logits = markov_m1_int8(latent, self.fold_packed)
+            else:
+                logits = int8_linear(latent, self.fold_packed)
+            return state, logits.add_(self.fold_bias)
         return state, torch.addmm(self.fold_bias, latent, self.fold_weight.T)
 
 
@@ -529,8 +557,17 @@ class Inkling2DSparkModel(nn.Module):
         and derive the weights that depend on them."""
         assert self.lm_head is not None
         weight = self.lm_head.weight
-        assert weight.dtype == torch.bfloat16 or is_packed_int8(weight) or is_packed_int4(weight)
+        assert (
+            weight.dtype == torch.bfloat16
+            or is_packed_int8(weight)
+            or is_packed_int4(weight)
+        )
         self.model.embed_norm = target_model.model.embed_norm
+        norm_workspace = draft_norm_workspace(self.config.hidden_size)
+        for layer in self.model.layers:
+            layer.input_layernorm.p2p_workspace = norm_workspace
+            layer.post_attention_layernorm.p2p_workspace = norm_workspace
+        self.model.norm.p2p_workspace = norm_workspace
         head = self.model.markov_head
         head.rnn_bias = torch.empty_like(head.rnn_proj.bias, dtype=torch.float32)
         self.refresh_derived_weights()
@@ -543,6 +580,16 @@ class Inkling2DSparkModel(nn.Module):
         assert self.lm_head is not None
         head = self.model.markov_head
         assert head.rnn_bias is not None
+        if os.getenv("VLLM_INKLING2_MARLIN_W8_DRAFT") == "1":
+            for layer in self.model.layers:
+                for proj in (
+                    layer.self_attn.qkv_proj,
+                    layer.self_attn.kv_proj_ctx,
+                    layer.self_attn.o_proj,
+                    layer.mlp.gate_up_proj,
+                    layer.mlp.down_proj,
+                ):
+                    prepare_marlin_w8(proj.weight, pack_int8_rows(proj.weight))
         head.fold(self.lm_head.weight)
         head.rnn_bias.copy_(head.rnn_proj.bias)
         self.model.fuse_alpha.copy_(
@@ -614,8 +661,13 @@ class Inkling2DSparkModel(nn.Module):
         shard = base_logits.shape[1]
         start = rank * shard
         packed = shard_reduce(
-            base_logits, bias, self.config.final_logit_softcapping, start,
-            self.config.vocab_size - start, rank, tp,
+            base_logits,
+            bias,
+            self.config.final_logit_softcapping,
+            start,
+            self.config.vocab_size - start,
+            rank,
+            tp,
         )
         return rank_combine(tensor_model_parallel_all_reduce(packed))
 

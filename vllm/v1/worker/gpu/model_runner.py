@@ -131,6 +131,8 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
+from vllm.v1.worker.gpu.inkling2_bench import Inkling2Measurements
+from vllm.v1.worker.gpu.inkling2_decode import DecodeLayout
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
@@ -338,12 +340,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner: PoolingRunner | None = None
 
         self.step_timing = StepTimingCollector()
+        self.inkling2_measurements = Inkling2Measurements.from_env(vllm_config, device)
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
             device=self.device,
         )
+        self.inkling2_layouts = {}
+        if (
+            os.getenv("VLLM_INKLING2_DECODE_TEMPLATES") == "1"
+            and vllm_config.model_config.hf_config.model_type
+            in ("inkling2", "inkling2_loop")
+            and self.max_num_reqs == 1
+            and not self.use_pp
+            and not vllm_config.scheduler_config.async_scheduling
+            and vllm_config.speculative_config
+            and vllm_config.speculative_config.method == "dspark"
+            and vllm_config.parallel_config.tensor_parallel_size == 2
+        ):
+            self.inkling2_layouts = {
+                w: DecodeLayout.create(w, device) for w in range(1, 9)
+            }
         self.fast_prefill: FastPrefillHelper | None = None
         if self.use_pp:
             self.pp_handler = PPHandler(
@@ -1524,6 +1542,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_padding[:num_tokens].fill_(False)
             is_padding[num_tokens:].fill_(True)
 
+        if (layout := self.inkling2_layouts.get(num_tokens)) is not None and (
+            not batch_req_state.has_prefill
+            and len(batch_req_state.req_ids) == 1
+            and batch_req_state.idx_mapping_np[0] == 0
+            and num_tokens
+            == 1
+            + len(
+                scheduler_output.scheduled_spec_decode_tokens.get(
+                    batch_req_state.req_ids[0], ()
+                )
+            )
+            and self.model_state.num_new_sampled_tokens_per_step == 1
+            and self.adaptive_verification is None
+            and self.pcp_manager is None
+            and self.fast_prefill is None
+            and self.model_config.rswa_window is None
+        ):
+            return layout.prepare(
+                self.req_states,
+                self.input_buffers,
+                batch_req_state,
+                scheduler_output,
+                num_tokens_after_padding,
+                is_padding,
+            )
+
         req_ids = batch_req_state.req_ids
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
         idx_mapping_np = batch_req_state.idx_mapping_np
@@ -1954,6 +1998,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        measurement = self.inkling2_measurements if not dummy_run else None
+        if measurement is not None:
+            measurement.execute_start()
         if not dummy_run:
             self.draft_tokens_handler.begin_step(scheduler_output)
             # Update the request states.
@@ -1978,6 +2025,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 return self._merge_ec_connector_no_forward(
                     scheduler_output, empty_output
                 )
+
+        if measurement is not None:
+            measurement.stamp("update_done")
 
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
@@ -2034,6 +2084,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
 
+        if measurement is not None:
+            measurement.stamp("dispatch_done")
         cudagraph_stats = None
         if not dummy_run:
             # Common case.
@@ -2044,7 +2096,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
+            if measurement is not None:
+                measurement.stamp("inputs_done")
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            if measurement is not None:
+                measurement.stamp("block_tables_done")
             # Mamba prefix-cache pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -2249,6 +2305,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
+        if measurement is not None:
+            measurement.forward_start(not input_batch.has_prefill)
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -2299,6 +2358,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        if measurement is not None:
+            measurement.forward_end(not input_batch.has_prefill)
         self.kv_connector.finish_forward()
 
         if self.is_last_pp_rank:
@@ -2564,6 +2625,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if defer_kv_finalize:
             self.kv_connector.finalize_step()
         model_runner_output.ec_connector_output = ec_connector_output
+        if self.inkling2_measurements is not None:
+            async_output.output_observer = self.inkling2_measurements.step_end(
+                input_batch, num_spec_tokens
+            )
 
         return async_output
 
@@ -2585,6 +2650,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return num_drafted, num_verified
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
+        if self.inkling2_measurements is not None:
+            return self.inkling2_measurements.take_drafts(
+                self.draft_tokens_handler.get_draft_tokens
+            )
         return self.draft_tokens_handler.get_draft_tokens()
 
     @torch.inference_mode()

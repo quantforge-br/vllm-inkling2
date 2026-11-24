@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_zero_points,
 )
 from vllm.scalar_type import scalar_types
+from vllm.triton_utils import triton
 
 GROUP = 128
 _N_ALIGN = 64
@@ -86,9 +87,9 @@ def pack_marlin_w4(
     q = ops.gptq_marlin_repack(gptq, k, size_n, 4)
     q.marlin_n = n
     q.marlin_k = k
-    q.marlin_scale = marlin_permute_scales(
-        scale.t().contiguous(), k, size_n, GROUP
-    ).to(codes.device)
+    q.marlin_scale = marlin_permute_scales(scale.t().contiguous(), k, size_n, GROUP).to(
+        codes.device
+    )
     q.marlin_zero = marlin_zero_points(
         zero.t().contiguous().cpu(), groups, size_n, 4
     ).to(codes.device)
@@ -123,7 +124,7 @@ def marlin_linear(
         None,
         weight.marlin_zero,
         get_marlin_workspace(x.device),
-        _QTYPE,
+        getattr(weight, "marlin_type", _QTYPE),
         size_m=m,
         size_n=size_n,
         size_k=k,
@@ -158,3 +159,37 @@ def marlin_parameter(
     for name in _ATTRS:
         setattr(param, name, getattr(packed, name))
     return param
+
+
+def prepare_marlin_w8(source: torch.Tensor, packed: torch.Tensor) -> None:
+    """Derive a Marlin shard from the same signed codes as the Triton GEMV.
+
+    The public source retains its physical row layout for vocab indexing and
+    refolding. Keep captured device pointers stable on a weight refresh.
+    """
+    from .int8_linear import ROW_PAD
+
+    n, stride = packed.shape
+    k = stride - ROW_PAD
+    assert packed.dtype == torch.int8 and k % 16 == 0
+    padded_n = triton.cdiv(n, _N_ALIGN) * _N_ALIGN
+    codes = torch.full((padded_n, k), 128, dtype=torch.uint8, device=packed.device)
+    torch.bitwise_xor(packed[:, :k].view(torch.uint8), 128, out=codes[:n])
+    gptq = codes.view(torch.int32).t().contiguous()
+    weight = ops.gptq_marlin_repack(gptq, k, padded_n, 8)
+    row_scales = packed[:, k : k + 4].contiguous().view(torch.float32).bfloat16()
+    scales = torch.nn.functional.pad(row_scales.t(), (0, padded_n - n))
+    scales = marlin_permute_scales(scales, k, padded_n, -1)
+    existing = getattr(source, "marlin_w8", None)
+    if existing is not None:
+        existing.copy_(weight)
+        existing.marlin_scale.copy_(scales)
+        source.marlin_row_scales.copy_(row_scales)
+        return
+    weight.marlin_n = n
+    weight.marlin_k = k
+    weight.marlin_type = scalar_types.uint8b128
+    weight.marlin_scale = scales
+    weight.marlin_zero = None
+    source.marlin_row_scales = row_scales
+    source.marlin_w8 = weight

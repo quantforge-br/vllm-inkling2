@@ -10,6 +10,9 @@ goes through the following sublayer's RMSNorm in the same kernel, or is
 returned as is (fp32) without a norm weight.
 """
 
+import functools
+import os
+
 import torch
 
 from vllm.models.inkling2.nvidia.ops.norm import rsqrt
@@ -243,6 +246,104 @@ def _attn_res_row_kernel(
     tl.store(out + db, acc_b.to(Out.dtype.element_ty), mask_b)
 
 
+@functools.cache
+def _multi_query_mode():
+    return int(os.getenv("VLLM_INKLING2_ATTN_RES_MULTI_QUERY", "0"))
+
+
+@triton.jit
+def _attn_res_multi_query_kernel(
+    Stack,
+    Last,
+    Addend,
+    Queries,
+    NormW,
+    Out,
+    stride_s,
+    T,
+    eps,
+    norm_eps,
+    D: tl.constexpr,
+    N_STACK: tl.constexpr,
+    HAS_ADDEND: tl.constexpr,
+    NORMALIZE: tl.constexpr,
+    APPLY_NORM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_A: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    Q: tl.constexpr,
+    CACHE: tl.constexpr,
+):
+    gdc_wait()
+    t = tl.program_id(0).to(tl.int64)
+    da = tl.arange(0, BLOCK_A)
+    db = BLOCK_A + tl.arange(0, BLOCK_B)
+    n_idx = tl.arange(0, BLOCK_N)
+    src = (Stack, stride_s, Last, Addend, t * D)
+    qa = ()
+    qb = ()
+    logits = ()
+    for q in tl.static_range(Q):
+        qa += (tl.load(Queries + q * D + da, da < D, 0),)
+        qb += (tl.load(Queries + q * D + db, db < D, 0),)
+        logits += (tl.full((BLOCK_N,), float("-inf"), tl.float32),)
+    inv_rms = tl.zeros((BLOCK_N,), tl.float32)
+    cache_a = ()
+    cache_b = ()
+    for n in tl.static_range(N_STACK + 1):
+        a = _load_source(*src, da, da < D, n, N_STACK, HAS_ADDEND)
+        b = _load_source(*src, db, db < D, n, N_STACK, HAS_ADDEND)
+        if CACHE:
+            cache_a += (a,)
+            cache_b += (b,)
+        rstd = rsqrt(tl.fma(tl.sum(a * a) + tl.sum(b * b), 1.0 / D, eps))
+        inv_rms = tl.where(n_idx == n, rstd, inv_rms)
+        updated = ()
+        for q in tl.static_range(Q):
+            dot = tl.sum(qa[q] * a) + tl.sum(qb[q] * b)
+            updated += (tl.where(n_idx == n, dot * rstd, logits[q]),)
+        logits = updated
+
+    probs = ()
+    inv_sums = ()
+    acc_a = ()
+    acc_b = ()
+    for q in tl.static_range(Q):
+        p = tldevice.exp(logits[q] - tl.max(logits[q]))
+        inv_sums += (tl.div_rn(1.0, tl.sum(p)),)
+        if NORMALIZE:
+            p = p * inv_rms
+        probs += (p,)
+        acc_a += (tl.zeros((BLOCK_A,), tl.float32),)
+        acc_b += (tl.zeros((BLOCK_B,), tl.float32),)
+    for n in tl.static_range(N_STACK + 1):
+        if CACHE:
+            a = cache_a[n]
+            b = cache_b[n]
+        else:
+            a = _load_source(*src, da, da < D, n, N_STACK, HAS_ADDEND)
+            b = _load_source(*src, db, db < D, n, N_STACK, HAS_ADDEND)
+        next_a = ()
+        next_b = ()
+        for q in tl.static_range(Q):
+            p = tl.sum(tl.where(n_idx == n, probs[q], 0.0))
+            next_a += (tl.fma(p, a, acc_a[q]),)
+            next_b += (tl.fma(p, b, acc_b[q]),)
+        acc_a = next_a
+        acc_b = next_b
+
+    for q in tl.static_range(Q):
+        a = acc_a[q] * inv_sums[q]
+        b = acc_b[q] * inv_sums[q]
+        if APPLY_NORM:
+            rstd = rsqrt(tl.div_rn(tl.sum(a * a) + tl.sum(b * b), D) + norm_eps)
+            a = a * rstd * tl.load(NormW + q * D + da, da < D, 0).to(tl.float32)
+            b = b * rstd * tl.load(NormW + q * D + db, db < D, 0).to(tl.float32)
+        row = Out + (q * T + t) * D
+        tl.store(row + da, a, da < D)
+        tl.store(row + db, b, db < D)
+
+
 def attn_res(
     stack: torch.Tensor,
     last: torch.Tensor,
@@ -300,6 +401,17 @@ def attn_res(
     if num_tokens * num_q <= 256:
         block_a = triton.next_power_of_2(d + 1) // 2
         block_b = max(triton.next_power_of_2(d - block_a), 16)
+        if num_q in (3, 4) and 0 < num_tokens <= 8 and _multi_query_mode():
+            _attn_res_multi_query_kernel[(num_tokens,)](
+                *args,
+                **meta,
+                BLOCK_A=block_a,
+                BLOCK_B=block_b,
+                Q=num_q,
+                CACHE=num_stack <= 2 and _multi_query_mode() == 2,
+                num_warps=8,
+            )
+            return out
         _attn_res_row_kernel[grid](
             *args, **meta, BLOCK_A=block_a, BLOCK_B=block_b, num_warps=8
         )

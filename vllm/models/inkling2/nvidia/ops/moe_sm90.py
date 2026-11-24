@@ -9,7 +9,9 @@ gathers each row's token, the down GEMM reads and writes row by row, and
 `ops.moe.combine` sums them with the identity `src2dst` (-1: not local).
 """
 
+import functools
 import json
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -35,6 +37,11 @@ _SM8X_SMALL_BATCH_TUNING = {
     "warp_shape": [8, 64, 64],
     "num_ctas_per_sm": 3,
 }
+
+
+@functools.cache
+def _fuse_verify_alignment():
+    return os.getenv("VLLM_INKLING2_FUSED_SELECT_ALIGN") == "1"
 
 
 @triton.jit
@@ -97,7 +104,9 @@ def _select_kernel(
             ),
         )
         positions = tl.arange(0, TOPK * ALIGN)
-        first = valid[:, None, :] & (rank[:, None, :] * ALIGN == positions[None, :, None])
+        first = valid[:, None, :] & (
+            rank[:, None, :] * ALIGN == positions[None, :, None]
+        )
         row = tl.sum(tl.where(first, slots[None, None, :], 0), 2)
         is_row = tl.sum(first.to(tl.int32), 2) > 0
         tl.store(SortedIds + positions[None, :], tl.where(is_row, row, TOPK))
@@ -124,6 +133,21 @@ def _align_rows_kernel(
     order, padded with `rows` to whole blocks, experts in ascending order."""
     index = tl.arange(0, R)
     ids = tl.load(Ids + index, index < rows, other=-1)
+    _align_local_ids(ids, SortedIds, BlockExperts, NumPadded, rows, R, B, MAX_BLOCKS)
+
+
+@triton.jit
+def _align_local_ids(
+    ids,
+    SortedIds,
+    BlockExperts,
+    NumPadded,
+    rows,
+    R: tl.constexpr,
+    B: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+):
+    index = tl.arange(0, R)
     valid = ids >= 0
     same = valid[:, None] & valid[None, :] & (ids[:, None] == ids[None, :])
     earlier = index[None, :] < index[:, None]
@@ -143,6 +167,58 @@ def _align_rows_kernel(
     for b in tl.static_range(MAX_BLOCKS):
         tl.store(BlockExperts + offset + b, ids, first & (b < blocks))
     tl.store(NumPadded + tl.arange(0, 1), tl.sum(blocks) * B + tl.arange(0, 1) * 0)
+
+
+@triton.jit
+def _select_align_verify_kernel(
+    Partials,
+    Bias,
+    ExpertBounds,
+    IsPadding,
+    Ids,
+    Weights,
+    Src2Dst,
+    SortedIds,
+    BlockExperts,
+    NumPadded,
+    T: tl.constexpr,
+    route_scale,
+    E: tl.constexpr,
+    E_POW2: tl.constexpr,
+    GROUPS: tl.constexpr,
+    TOPK: tl.constexpr,
+    ALIGN: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    token = tl.arange(0, TILE)
+    # The helper loads every row passed to it. Duplicate a valid row in the
+    # padded lanes, then exclude those lanes from every store and alignment.
+    source = tl.minimum(token, T - 1)
+    bias = _load_bias(Bias, E, E_POW2)
+    ids, weights = _select_experts(
+        Partials, bias, source, T, route_scale, E, E_POW2, GROUPS, TOPK, True
+    )
+    padding = token >= T
+    if IsPadding is not None:
+        padding = padding | tl.load(IsPadding + source)
+    local = _local_experts(
+        ids, tl.load(ExpertBounds), tl.load(ExpertBounds + 1), padding
+    )
+    rows = token[:, None] * TOPK + tl.arange(0, TOPK)[None, :]
+    valid = token[:, None] < T
+    tl.store(Ids + rows, local, valid)
+    tl.store(Weights + rows, weights, valid)
+    tl.store(Src2Dst + rows, tl.where(local >= 0, rows, -1), valid)
+    _align_local_ids(
+        tl.reshape(local, (TILE * TOPK,)),
+        SortedIds,
+        BlockExperts,
+        NumPadded,
+        T * TOPK,
+        TILE * TOPK,
+        ALIGN,
+        tl.cdiv(T, ALIGN),
+    )
 
 
 def align_rows(
@@ -200,12 +276,34 @@ def select_experts(
     src2dst = torch.empty(tokens * topk, dtype=torch.int32, device=x.device)
     alignment = None
     if align_block:
-        assert tokens == 1 and align_block & (align_block - 1) == 0
+        assert 1 <= tokens <= 8 and align_block & (align_block - 1) == 0
+        rows = tokens * topk
         alignment = (
-            torch.empty(topk * align_block, dtype=torch.int32, device=x.device),
-            torch.empty(topk, dtype=torch.int32, device=x.device),
+            torch.empty(rows * align_block, dtype=torch.int32, device=x.device),
+            torch.empty(rows, dtype=torch.int32, device=x.device),
             torch.empty(1, dtype=torch.int32, device=x.device),
         )
+        if tokens > 1:
+            _select_align_verify_kernel[(1,)](
+                partials,
+                bias,
+                expert_bounds,
+                is_padding,
+                ids,
+                weights,
+                src2dst,
+                *alignment,
+                tokens,
+                route_scale,
+                experts,
+                triton.next_power_of_2(experts),
+                partials.shape[0],
+                topk,
+                align_block,
+                triton.next_power_of_2(tokens),
+                num_warps=8,
+            )
+            return ids, weights, src2dst, alignment
     _select_kernel[(tokens,)](
         partials,
         bias,
@@ -439,7 +537,9 @@ class HummingExperts:
     ) -> int:
         """The row block size `select_experts` can align a batch of `tokens`
         for in its own launch (0: none; `moe_align_block_size` runs)."""
-        if tokens != 1:
+        if tokens != 1 and not (
+            2 <= tokens <= 8 and topk == 8 and _fuse_verify_alignment()
+        ):
             return 0
         _, block_m = self._block_sizes(tokens * topk, num_global_experts)
         sizes = set(block_m.values())

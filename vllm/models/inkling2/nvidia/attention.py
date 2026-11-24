@@ -3,9 +3,9 @@
 """Inkling2 attention: relative-bias GQA with short-conv K/V, L2-clipped
 q/k/r, gated output and per-token attention sinks."""
 
+import os
 from dataclasses import dataclass, field
 from functools import partial
-import os
 from typing import cast
 
 import numpy as np
@@ -52,14 +52,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig, KVQuan
 from ..configs import Inkling2ModelConfig
 from .lora import add_linear_lora
 from .ops import use_portable_kernels, use_sm100_kernels
-from .ops.gptq import COLLECTOR, collect_dir, hessian_dir, quantize_projection
-from .ops.marlin_linear import dense_bits, is_packed_marlin, marlin_parameter
-from .ops.int8_linear import (
-    int8_dense_enabled,
-    int8_gemv_slices,
-    is_packed_int8,
-    pack_int8_rows,
-)
 from .ops.attention import (
     _INKLING2_FA4_REL_ATTENTION_KERNEL,
     gate_sink,
@@ -68,7 +60,15 @@ from .ops.attention import (
     rel_decode_attention,
 )
 from .ops.attention_sm90 import MODE_OUT_LSE, rel_attention
+from .ops.gptq import COLLECTOR, collect_dir, hessian_dir, quantize_projection
+from .ops.int8_linear import (
+    int8_dense_enabled,
+    int8_gemv_slices,
+    is_packed_int8,
+    pack_int8_rows,
+)
 from .ops.linear import linear
+from .ops.marlin_linear import dense_bits, is_packed_marlin, marlin_parameter
 from .ops.sconv import attention_prologue, shift_rel_proj
 from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
 
@@ -326,15 +326,18 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
         self.int8_kv = cache_dtype == "int8_per_token_head"
         spec = vllm_config.speculative_config
-        if self.int8_kv and spec is not None:
+        if (
+            self.int8_kv
+            and spec is not None
+            and spec.kv_cache_dtype not in ("auto", "bfloat16")
+        ):
             # The DSpark draft keeps its KV through the stock FlashAttention
             # cache update, which has no int8 per-token-head path: it needs
             # its own bf16 cache (`kv_cache_dtype` of the speculative config).
-            if spec.kv_cache_dtype not in ("auto", "bfloat16"):
-                raise ValueError(
-                    "Inkling2 int8 KV with speculative decoding requires "
-                    "kv_cache_dtype 'bfloat16' in the speculative config"
-                )
+            raise ValueError(
+                "Inkling2 int8 KV with speculative decoding requires "
+                "kv_cache_dtype 'bfloat16' in the speculative config"
+            )
         if cache_dtype == "float16" and vllm_config.speculative_config is not None:
             raise ValueError("Inkling2 FP16 KV requires speculative decoding disabled")
         # LoRA wrappers and reloads expect the bf16 / int8 layouts.
@@ -356,7 +359,10 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                     # The Marlin scales and zero points live outside the
                     # parameter storage: a reload or a processed-weight cache
                     # would pair new codes with stale (or missing) metadata.
-                    if is_packed_marlin(proj.weight) or not proj.weight.is_floating_point():
+                    if (
+                        is_packed_marlin(proj.weight)
+                        or not proj.weight.is_floating_point()
+                    ):
                         raise RuntimeError(
                             "Inkling2 Marlin W4 projections "
                             "(VLLM_INKLING2_DENSE_BITS=4) cannot be reloaded or "

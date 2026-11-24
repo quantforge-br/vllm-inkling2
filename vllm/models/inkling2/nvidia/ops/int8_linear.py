@@ -154,6 +154,37 @@ def _int8_gemv_wide_kernel(
     )
 
 
+@functools.cache
+def markov_m1_enabled() -> bool:
+    return os.getenv("VLLM_INKLING2_MARKOV_M1", "0") == "1"
+
+
+@triton.jit
+def _markov_m1_int8_kernel(X, W, Y, N, SW, BN: tl.constexpr):
+    rows = tl.program_id(0) * BN + tl.arange(0, BN)
+    cols = tl.arange(0, 256)
+    valid = rows < N
+    w = W + rows.to(tl.int64) * SW
+    codes = tl.load(w[:, None] + cols[None, :], valid[:, None], other=0)
+    x = tl.load(X + cols).to(tl.float32)
+    scale = tl.load((w + 256).to(tl.pointer_type(tl.float32)), valid, other=0)
+    y = tl.sum(codes.to(tl.float32) * x[None, :], axis=1) * scale
+    tl.store(Y + rows, y.to(Y.dtype.element_ty), valid)
+
+
+def markov_m1_int8(x: torch.Tensor, packed: torch.Tensor) -> torch.Tensor:
+    """Project one Markov state against the physical TP-local vocabulary rows."""
+    assert x.shape == (1, 256) and x.stride(-1) == 1
+    assert packed.shape[1] == 256 + ROW_PAD and packed.stride(-1) == 1
+    assert packed.stride(0) % 16 == 0 and packed.dtype == torch.int8
+    n = packed.shape[0]
+    out = x.new_empty((1, n))
+    _markov_m1_int8_kernel[(triton.cdiv(n, 16),)](
+        x, packed, out, n, packed.stride(0), BN=16, num_warps=4
+    )
+    return out
+
+
 @triton.jit
 def _int8_gemv_slices_kernel(
     X,
@@ -321,6 +352,10 @@ def int8_linear(
 ) -> torch.Tensor:
     """`x @ dequant(weight).T` with fp32 accumulation for bf16/fp16 `x`
     `[..., K]` and a `pack_int8_rows` weight `[N, K + ROW_PAD]`."""
+    if (marlin := getattr(weight, "marlin_w8", None)) is not None:
+        from .marlin_linear import marlin_linear
+
+        return marlin_linear(x, marlin, out, out_dtype)
     k = weight.shape[1] - ROW_PAD
     assert x.shape[-1] == k and x.stride(-1) == 1 and weight.stride(-1) == 1
     assert weight.stride(0) % 16 == 0

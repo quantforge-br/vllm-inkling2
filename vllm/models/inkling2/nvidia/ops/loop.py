@@ -153,6 +153,8 @@ def _fused_down_norm() -> bool:
     """Whether `controller_blend` normalizes inside the down projection
     (`VLLM_INKLING2_FUSED_CONTROLLER_NORM`, default on)."""
     return os.environ.get("VLLM_INKLING2_FUSED_CONTROLLER_NORM", "1") == "1"
+
+
 # Input columns per `_controller_down_kernel` program.
 _DOWN_SLICE = 256
 # Output columns per `_controller_blend_kernel` program.
@@ -210,7 +212,7 @@ def _controller_down_norm_kernel(
     t = tl.program_id(1).to(tl.int64)
     s = tl.program_id(2).to(tl.int64)
     half: tl.constexpr = D // BK
-    if g < half:
+    if g < half:  # noqa: SIM108 - constexpr branch avoids evaluating both pointers
         src = Dest + s * stride_dest_s + t * D
     else:
         src = Message + (s * T + t) * D
@@ -275,7 +277,146 @@ def _controller_blend_kernel(
     message = tl.load(Message + row * D + cols)
     x = (1.0 - forget) * dest + gain * message
     tl.store(Mixed + row * D + cols, x)
-    tl.store(SumSq + row * (D // BN) + c + tl.arange(0, 1), tl.sum(x * x) + tl.zeros((1,), tl.float32))
+    tl.store(
+        SumSq + row * (D // BN) + c + tl.arange(0, 1),
+        tl.sum(x * x) + tl.zeros((1,), tl.float32),
+    )
+
+
+@functools.cache
+def _grouped_controller() -> tuple[int, bool]:
+    group = int(os.getenv("VLLM_INKLING2_CONTROLLER_TOKEN_GROUP", "1"))
+    if group not in (1, 2, 4, 8):
+        raise ValueError("Inkling 2 controller token group must be 1, 2, 4 or 8")
+    return group, os.getenv("VLLM_INKLING2_CONTROLLER_RSTD_PREPASS", "0") == "1"
+
+
+@triton.jit
+def _controller_rstd(src, row_ok, eps, D: tl.constexpr, BLOCK: tl.constexpr):
+    cols = tl.arange(0, BLOCK)
+    row = tl.load(src + cols, row_ok & (cols < D), other=0)
+    return rsqrt(tl.div_rn(tl.sum(row * row), D) + eps)
+
+
+@triton.jit
+def _controller_rstd_kernel(
+    Dest,
+    Message,
+    Rstd,
+    stride_dest_s,
+    T,
+    eps,
+    D: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    t = tl.program_id(0).to(tl.int64)
+    s = tl.program_id(1).to(tl.int64)
+    half = tl.program_id(2)
+    row = s * T + t
+    src = tl.where(half == 0, Dest + s * stride_dest_s + t * D, Message + row * D)
+    rstd = _controller_rstd(src, True, eps, D, BLOCK)
+    tl.store(Rstd + row * 2 + half, rstd)
+
+
+@triton.jit
+def _controller_down_grouped_kernel(
+    Dest,
+    Message,
+    Down,
+    Partials,
+    Rstd,
+    stride_dest_s,
+    T,
+    eps,
+    D: tl.constexpr,
+    R: tl.constexpr,
+    BK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    GROUP: tl.constexpr,
+    PREPASS: tl.constexpr,
+):
+    g = tl.program_id(0).to(tl.int64)
+    first = tl.program_id(1).to(tl.int64) * GROUP
+    s = tl.program_id(2).to(tl.int64)
+    half = g // (D // BK)
+    offset = (g % (D // BK)) * BK + tl.arange(0, BK)
+    src = tl.where(half == 0, Dest + s * stride_dest_s, Message + s * T * D)
+    lanes = tl.arange(0, 16)
+    t = first + lanes
+    mask = (lanes < GROUP) & (t < T)
+    if PREPASS:
+        rstd = tl.load(Rstd + (s * T + t) * 2 + half, mask, other=0)
+        values = tl.load(src + offset[:, None] + t[None, :] * D, mask[None, :], other=0)
+        x = (values * rstd[None, :]).to(tl.bfloat16)
+    else:
+        x = tl.full((BK, 16), 0, tl.bfloat16)
+        for i in tl.static_range(GROUP):
+            row = src + (first + i) * D
+            rstd = _controller_rstd(row, first + i < T, eps, D, BLOCK)
+            values = tl.load(row + offset, first + i < T, other=0)
+            x = tl.where(
+                lanes[None, :] == i, (values * rstd)[:, None].to(tl.bfloat16), x
+            )
+    ranks = tl.arange(0, R)
+    ks = g * BK + tl.arange(0, BK)
+    w = tl.load(Down + s * (R * 2 * D) + ranks[:, None] * (2 * D) + ks[None, :])
+    partials = tl.dot(w, x)
+    dst = Partials + ((s * T + t) * (2 * D // BK) + g) * R
+    tl.store(dst[None, :] + ranks[:, None], partials, mask[None, :])
+
+
+@triton.jit
+def _controller_blend_grouped_kernel(
+    Dest,
+    Message,
+    Partials,
+    GainForget,
+    Mixed,
+    SumSq,
+    stride_dest_s,
+    T,
+    D: tl.constexpr,
+    R: tl.constexpr,
+    G: tl.constexpr,
+    G_POW2: tl.constexpr,
+    BN: tl.constexpr,
+    GROUP: tl.constexpr,
+):
+    c = tl.program_id(0).to(tl.int64)
+    first = tl.program_id(1).to(tl.int64) * GROUP
+    s = tl.program_id(2).to(tl.int64)
+    lanes = tl.arange(0, 16)
+    t = first + lanes
+    row = s * T + t
+    mask = (lanes < GROUP) & (t < T)
+    ranks = tl.arange(0, R)
+    slices = tl.arange(0, G_POW2)
+    hidden = tl.full((R, 16), 0, tl.bfloat16)
+    for i in tl.static_range(GROUP):
+        part = (s * T + first + i) * G + slices
+        values = tl.load(
+            Partials + part[:, None] * R + ranks[None, :],
+            (slices[:, None] < G) & (first + i < T),
+            other=0,
+        )
+        h = tl.sum(values, 0).to(tl.bfloat16)
+        hidden = tl.where(lanes[None, :] == i, h[:, None], hidden)
+    both = tl.arange(0, 2 * BN)
+    out_rows = c * BN + both % BN + tl.where(both >= BN, D, 0)
+    weights = GainForget + s * (2 * D * R) + out_rows[:, None] * R + ranks[None, :]
+    product = tl.dot(tl.load(weights), hidden)
+    gain, forget = tl.split(tl.permute(tl.reshape(product, (2, BN, 16)), (1, 2, 0)))
+    cols = c * BN + tl.arange(0, BN)
+    dest = tl.load(
+        Dest + s * stride_dest_s + t[None, :] * D + cols[:, None],
+        mask[None, :],
+        other=0,
+    )
+    dst = row[None, :] * D + cols[:, None]
+    message = tl.load(Message + dst, mask[None, :], other=0)
+    x = (1.0 - tldevice.tanh(forget)) * dest + tldevice.tanh(gain) * message
+    tl.store(Mixed + dst, x, mask[None, :])
+    tl.store(SumSq + row * (D // BN) + c, tl.sum(x * x, axis=0), mask)
 
 
 @triton.jit
@@ -343,7 +484,44 @@ def controller_blend(
     num_slices = 2 * d // _DOWN_SLICE
     partials = message.new_empty((num_streams, num_tokens, num_slices, rank))
     grid = (num_slices, num_tokens, num_streams)
-    if _fused_down_norm() and d % _DOWN_SLICE == 0:
+    fused_norm = _fused_down_norm() and d % _DOWN_SLICE == 0
+    group, prepass = _grouped_controller()
+    grouped = group > 1 and 1 < num_tokens <= CONTROLLER_MAX_TOKENS and fused_norm
+    if grouped:
+        rstd = message
+        if prepass:
+            rstd = message.new_empty((num_streams, num_tokens, 2))
+            _controller_rstd_kernel[(num_tokens, num_streams, 2)](
+                dest,
+                message,
+                rstd,
+                dest.stride(0),
+                num_tokens,
+                1e-6,
+                D=d,
+                BLOCK=triton.next_power_of_2(d),
+                num_warps=_DOWN_WARPS,
+            )
+        tiles = triton.cdiv(num_tokens, group)
+        _controller_down_grouped_kernel[(num_slices, tiles, num_streams)](
+            dest,
+            message,
+            down,
+            partials,
+            rstd,
+            dest.stride(0),
+            num_tokens,
+            1e-6,
+            D=d,
+            R=rank,
+            BK=_DOWN_SLICE,
+            BLOCK=triton.next_power_of_2(d),
+            GROUP=group,
+            PREPASS=prepass,
+            num_warps=_DOWN_WARPS,
+            num_stages=1,
+        )
+    elif fused_norm:
         _controller_down_norm_kernel[grid](
             dest,
             message,
@@ -376,25 +554,46 @@ def controller_blend(
     num_chunks = d // _BLEND_SLICE
     mixed = torch.empty_like(message)
     sum_sq = message.new_empty((num_streams, num_tokens, num_chunks))
-    _controller_blend_kernel[(num_chunks, num_tokens, num_streams)](
-        dest,
-        message,
-        partials,
-        gain_forget,
-        mixed,
-        sum_sq,
-        dest.stride(0),
-        num_tokens,
-        D=d,
-        R=rank,
-        G=num_slices,
-        G_POW2=triton.next_power_of_2(num_slices),
-        BN=_BLEND_SLICE,
-        num_warps=_BLEND_WARPS,
-        num_stages=1,
-        # The blend is unfused (no FMA), as the reference.
-        enable_fp_fusion=False,
-    )
+    if grouped:
+        _controller_blend_grouped_kernel[(num_chunks, tiles, num_streams)](
+            dest,
+            message,
+            partials,
+            gain_forget,
+            mixed,
+            sum_sq,
+            dest.stride(0),
+            num_tokens,
+            D=d,
+            R=rank,
+            G=num_slices,
+            G_POW2=triton.next_power_of_2(num_slices),
+            BN=_BLEND_SLICE,
+            GROUP=group,
+            num_warps=_BLEND_WARPS,
+            num_stages=1,
+            enable_fp_fusion=False,
+        )
+    else:
+        _controller_blend_kernel[(num_chunks, num_tokens, num_streams)](
+            dest,
+            message,
+            partials,
+            gain_forget,
+            mixed,
+            sum_sq,
+            dest.stride(0),
+            num_tokens,
+            D=d,
+            R=rank,
+            G=num_slices,
+            G_POW2=triton.next_power_of_2(num_slices),
+            BN=_BLEND_SLICE,
+            num_warps=_BLEND_WARPS,
+            num_stages=1,
+            # The blend is unfused (no FMA), as the reference.
+            enable_fp_fusion=False,
+        )
     out = message.new_empty((num_streams, num_tokens, d), dtype=torch.bfloat16)
     _controller_norm_kernel[(num_streams, num_tokens)](
         mixed,
