@@ -613,3 +613,84 @@ def test_sm86_full_attention_skips_old_int8_bias(monkeypatch, query_len, splits)
                     torch.testing.assert_close(got, want, rtol=0, atol=0)
     finally:
         _skip_old_bias.cache_clear()
+
+
+@pytest.mark.skipif(
+    _cap is None or (_cap.major, _cap.minor) != (8, 6),
+    reason="Coverage for the SM86 int8 per-token-head prefill path",
+)
+@pytest.mark.parametrize("query_len,kv_len", [(300, 300), (64, 1500), (513, 2100)])
+@pytest.mark.parametrize("pv_fp16_acc", [False, True])
+@torch.inference_mode()
+def test_sm86_int8_qk_prefill_matches_bf16_qk(
+    monkeypatch, query_len, kv_len, pv_fp16_acc
+):
+    """INT8 QK^T (with the key-mean LSE correction) tracks the BF16 QK^T
+    prefill on int8 keys that share a channel offset."""
+    from vllm.models.inkling2.nvidia.ops import attention_sm90 as attn
+
+    torch.manual_seed(7)
+    heads, kv_heads, page, dim = 12, 4, 16, 128
+    pages = -(-kv_len // page)
+    keys = torch.nn.functional.normalize(
+        torch.randn(pages * page, kv_heads, dim, device="cuda"), dim=-1
+    ) * 2 + 0.5 * torch.randn(1, kv_heads, dim, device="cuda")
+    values = torch.randn(pages * page, kv_heads, dim, device="cuda")
+    packed = torch.empty(
+        (pages, page, kv_heads, 2 * dim + 8), dtype=torch.int8, device="cuda"
+    )
+    flat = packed.view(-1, kv_heads, 2 * dim + 8)
+    for offset, x in ((0, keys), (dim, values)):
+        scale = x.abs().amax(-1, keepdim=True) / 127
+        flat[..., offset : offset + dim] = (x / scale).round().to(torch.int8)
+        flat[..., 2 * dim :].view(torch.float32)[..., offset // dim] = scale[..., 0]
+    q = (
+        torch.nn.functional.normalize(
+            torch.randn(query_len, heads, dim, device="cuda"), dim=-1
+        )
+        * 3
+    ).bfloat16()
+    rel = torch.randn(query_len, heads, REL_EXTENT, device="cuda").bfloat16()
+    sheared = shear_rel_logits(rel, [(query_len, kv_len)], 128, False)
+    table = torch.randperm(pages, device="cuda").view(1, -1).int()
+
+    def run(int8_qk):
+        monkeypatch.setenv("VLLM_INKLING2_PREFILL_ATTN_INT8", "1" if int8_qk else "0")
+        monkeypatch.setenv(
+            "VLLM_INKLING2_PREFILL_ATTN_PV_F16ACC", "1" if pv_fp16_acc else "0"
+        )
+        attn.prefill_attn_int8.cache_clear()
+        attn.prefill_attn_pv_fp16_acc.cache_clear()
+        out = torch.empty(q.shape, dtype=torch.float32, device="cuda")
+        lse = torch.empty(heads, query_len, device="cuda")
+        attn.rel_attention(
+            q,
+            packed[..., :dim],
+            packed[..., dim : 2 * dim],
+            out,
+            lse,
+            sheared,
+            block_table=table,
+            cache_seqlens=torch.tensor([kv_len], device="cuda", dtype=torch.int32),
+            cu_seqlens_q=torch.tensor([0, query_len], device="cuda", dtype=torch.int32),
+            max_query_len=query_len,
+            softmax_scale=8 * dim**-0.5,
+            window=0,
+            num_splits=1,
+            mode=attn.MODE_OUT_LSE,
+        )
+        return out, lse
+
+    try:
+        want_out, want_lse = run(False)
+        got_out, got_lse = run(True)
+    finally:
+        attn.prefill_attn_int8.cache_clear()
+        attn.prefill_attn_pv_fp16_acc.cache_clear()
+    cos = torch.nn.functional.cosine_similarity(
+        got_out.flatten(1), want_out.flatten(1), dim=-1
+    )
+    assert cos.min() > 0.9999
+    assert not torch.equal(got_lse, want_lse)  # the int8 path ran
+    torch.testing.assert_close(got_out, want_out, atol=3e-2, rtol=0)
+    torch.testing.assert_close(got_lse, want_lse, atol=1e-2, rtol=0)

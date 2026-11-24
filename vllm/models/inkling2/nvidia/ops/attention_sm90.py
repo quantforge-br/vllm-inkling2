@@ -64,6 +64,20 @@ def _skip_old_bias() -> bool:
     return os.getenv("VLLM_INKLING2_ATTN_SKIP_OLD_BIAS", "0") == "1"
 
 
+@functools.cache
+def prefill_attn_int8() -> bool:
+    return os.getenv("VLLM_INKLING2_PREFILL_ATTN_INT8", "0") == "1"
+
+
+@functools.cache
+def prefill_attn_pv_fp16_acc() -> bool:
+    return os.getenv("VLLM_INKLING2_PREFILL_ATTN_PV_F16ACC", "0") == "1"
+
+
+# Smallest query length whose int8 KV prefill takes the int8 QK^T path.
+PREFILL_ATTN_INT8_MIN_Q = 64
+
+
 @triton.jit
 def _relative_scores(
     score,
@@ -88,6 +102,53 @@ def _relative_scores(
 
 
 @triton.jit
+def _key_mean_kernel(
+    K,
+    BlockTable,
+    SeqLens,
+    CuSeqlensQ,
+    Mean,
+    stride_kv_blk,
+    stride_kv_slot,
+    stride_kv_h,
+    stride_bt,
+    D: tl.constexpr,
+    PAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # fp32 mean of the dequantized int8 keys a request appends (one KV head).
+    req = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    q_len = tl.load(CuSeqlensQ + req + 1) - tl.load(CuSeqlensQ + req)
+    seqlen_k = tl.load(SeqLens + req)
+    offs_d = tl.arange(0, D)
+    acc = tl.zeros([D], tl.float32)
+    for start in range(seqlen_k - q_len, seqlen_k, BLOCK):
+        keys = start + tl.arange(0, BLOCK)
+        valid = keys < seqlen_k
+        page = tl.load(
+            BlockTable + req.to(tl.int64) * stride_bt + keys // PAGE,
+            mask=valid,
+            other=0,
+        )
+        ptrs = (
+            page.to(tl.int64) * stride_kv_blk
+            + (keys % PAGE) * stride_kv_slot
+            + kv_head * stride_kv_h
+        )
+        codes = tl.load(K + ptrs[:, None] + offs_d[None, :], mask=valid[:, None])
+        scale = tl.load(
+            (K + ptrs + 2 * D).to(tl.pointer_type(tl.float32)), mask=valid, other=0.0
+        )
+        acc += tl.sum(codes.to(tl.float32) * scale[:, None], 0)
+    num_kv_heads = tl.num_programs(1)
+    tl.store(
+        Mean + (req * num_kv_heads + kv_head) * D + offs_d,
+        acc / tl.maximum(q_len, 1).to(tl.float32),
+    )
+
+
+@triton.jit
 def _rel_attention_kernel(
     Q,
     K,
@@ -100,6 +161,7 @@ def _rel_attention_kernel(
     Lse,
     Gate,
     Sink,
+    KeyMean,
     softmax_scale,
     num_tokens,
     num_splits,
@@ -124,6 +186,8 @@ def _rel_attention_kernel(
     WINDOW: tl.constexpr,
     DRAFT: tl.constexpr,
     SKIP_OLD_BIAS: tl.constexpr,
+    INT8_QK: tl.constexpr,
+    PV_F16_ACC: tl.constexpr,
     MODE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -178,6 +242,20 @@ def _rel_attention_kernel(
         rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
 
     qk_scale = softmax_scale * LOG2E
+    if INT8_QK:
+        # Symmetric int8 rows of Q: QK^T of the int8 K codes runs on the
+        # int8 tensor cores; the row and key scales go on the int32 scores.
+        q_f32 = q.to(tl.float32)
+        q_amax = tl.max(tl.abs(q_f32), 1)
+        q_scale = tl.where(q_amax > 0, q_amax / 127.0, 1.0)
+        q_i8 = tl.extra.cuda.libdevice.rint(q_f32 / q_scale[:, None]).to(tl.int8)
+        row_scale = q_scale * qk_scale
+        # The rounding error of Q shifts every score of a row by about its
+        # dot with the mean key (large when keys share a channel offset):
+        # softmax ignores the shift, the LSE takes it back.
+        key_mean = tl.load(KeyMean + (req * (H // G) + kv_head) * D + offs_d)
+        q_err = q_f32 - q_i8.to(tl.float32) * q_scale[:, None]
+        lse_shift = tl.sum(q_err * key_mean[None, :], 1) * qk_scale
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, D], tl.float32)
@@ -196,17 +274,27 @@ def _rel_attention_kernel(
             # (8-byte aligned): exact integer codes in bf16/fp16, each key's
             # fp32 scale applied to its score column.
             kv_ptrs = tl.multiple_of(kv_ptrs, 8)
-            k = tl.load(
-                K + kv_ptrs[None, :] + offs_d[:, None],
-                mask=key_valid[None, :],
-                other=0,
-            ).to(q.dtype)
             k_scale = tl.load(
                 (K + kv_ptrs + 2 * D).to(tl.pointer_type(tl.float32)),
                 mask=key_valid,
                 other=0.0,
             )
-            s = tl.dot(q, k) * (k_scale * qk_scale)[None, :]
+            if INT8_QK:
+                # Key rows stay K-contiguous, the int8 MMA operand layout.
+                k_rows = tl.load(
+                    K + kv_ptrs[:, None] + offs_d[None, :],
+                    mask=key_valid[:, None],
+                    other=0,
+                )
+                s = tl.dot(q_i8, tl.trans(k_rows), out_dtype=tl.int32).to(tl.float32)
+                s = s * row_scale[:, None] * k_scale[None, :]
+            else:
+                k = tl.load(
+                    K + kv_ptrs[None, :] + offs_d[:, None],
+                    mask=key_valid[None, :],
+                    other=0,
+                ).to(q.dtype)
+                s = tl.dot(q, k) * (k_scale * qk_scale)[None, :]
         else:
             if K.dtype.element_ty.primitive_bitwidth == 8:
                 k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D).T
@@ -239,7 +327,7 @@ def _rel_attention_kernel(
                 V + kv_ptrs[:, None] + offs_d[None, :],
                 mask=key_valid[:, None],
                 other=0,
-            ).to(q.dtype)
+            ).to(tl.float16 if PV_F16_ACC else q.dtype)
             v_scale = tl.load(
                 (V + kv_ptrs + D + 4).to(tl.pointer_type(tl.float32)),
                 mask=key_valid,
@@ -257,12 +345,20 @@ def _rel_attention_kernel(
                     other=0.0,
                 ).to(q.dtype)
             pv = p
-        acc = acc * alpha[:, None] + tl.dot(pv.to(v.dtype), v)
+        if PV_F16_ACC:
+            # Per-block fp16 accumulation (2x the fp32-accumulate HMMA rate
+            # on GeForce Ampere); the running sum stays fp32.
+            pv_blk = tl.dot(pv.to(tl.float16), v, out_dtype=tl.float16)
+            acc = acc * alpha[:, None] + pv_blk.to(tl.float32)
+        else:
+            acc = acc * alpha[:, None] + tl.dot(pv.to(v.dtype), v)
         m_i = m_new
 
     empty = l_i == 0.0
     o = acc / tl.where(empty, 1.0, l_i)[:, None]
     lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
+    if INT8_QK:
+        lse2 += lse_shift
     if MODE == 0:
         tl.store(
             Out
@@ -357,6 +453,32 @@ def rel_attention(
         lse = out
     block_m = _block_m(max_query_len, group)
     tokens_per_tile = block_m // group
+    int8_qk = (
+        key_cache.dtype == torch.int8
+        and mode == MODE_OUT_LSE
+        and max_query_len >= PREFILL_ATTN_INT8_MIN_Q
+        and prefill_attn_int8()
+    )
+    key_mean = q
+    if int8_qk:
+        reqs = cache_seqlens.shape[0]
+        key_mean = torch.empty(
+            (reqs, num_kv_heads, head_dim), dtype=torch.float32, device=q.device
+        )
+        _key_mean_kernel[(reqs, num_kv_heads)](
+            key_cache,
+            block_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            key_mean,
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            block_table.stride(0),
+            D=head_dim,
+            PAGE=page,
+            BLOCK=64,
+        )
     num_reqs = cache_seqlens.shape[0]
     grid = (
         triton.cdiv(max_query_len, tokens_per_tile),
@@ -383,6 +505,7 @@ def rel_attention(
         lse,
         gate,
         sinks,
+        key_mean,
         softmax_scale,
         num_tokens,
         num_splits,
@@ -411,6 +534,8 @@ def rel_attention(
             and key_cache.dtype == torch.int8
             and _skip_old_bias()
         ),
+        INT8_QK=int8_qk,
+        PV_F16_ACC=int8_qk and prefill_attn_pv_fp16_acc(),
         MODE=mode,
         BLOCK_M=block_m,
         BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,
