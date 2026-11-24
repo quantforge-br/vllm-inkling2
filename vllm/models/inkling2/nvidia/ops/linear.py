@@ -3,6 +3,9 @@
 """bf16 linears: small batches on FlashInfer's CuTe DSL low-M kernels, and the
 reference `linear` with fp32 accumulation in ordered 1024-wide K groups."""
 
+import functools
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -218,6 +221,13 @@ def _k_group_tma_kernel(
 TMA_MIN_TOKENS = 2048
 
 
+@functools.cache
+def _tune_sm86_router(device: torch.device) -> bool:
+    return os.getenv(
+        "VLLM_INKLING2_SM86_ROUTER_TILES"
+    ) == "1" and torch.cuda.get_device_capability(device) == (8, 6)
+
+
 def k_group_partials(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -263,6 +273,12 @@ def k_group_partials(
     num_stages = 4 if not split else 3 if block_n <= 64 else 2
     if sm120:
         num_stages = min(num_stages, 2)
+    prefetch = split
+    if 1 <= tokens <= 8 and (n, hidden) == (128, 2304) and _tune_sm86_router(x.device):
+        block_n = 16
+        num_warps = 2 if tokens == 1 else 4
+        num_stages = 3
+        prefetch = False
     out = torch.empty(
         (groups if split else 1, tokens, n),
         dtype=torch.float32 if split else out_dtype,
@@ -283,7 +299,7 @@ def k_group_partials(
         block_m,
         block_n,
         split,
-        PREFETCH=split,
+        PREFETCH=prefetch,
         num_warps=num_warps,
         num_stages=num_stages,
         enable_fp_fusion=False,
