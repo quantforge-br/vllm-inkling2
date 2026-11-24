@@ -179,3 +179,31 @@ def test_packed_int4_layers_load_shards_into_marlin(dist_init, default_vllm_conf
         )
         if got.shape[1] > want.shape[0]:
             assert not got[:, want.shape[0] :].any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_int8_embedding_matches_dequantized_table(dist_init, default_vllm_config):
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+    from vllm.models.inkling2.nvidia.ops.embedding_int8 import (
+        make_embedding_int8,
+        quantize_embedding_int8,
+    )
+
+    torch.manual_seed(0)
+    with torch.device("cuda"):
+        embed = VocabParallelEmbedding(1000, 256)
+    embed.weight.data.normal_(0, 0.02)
+    table = embed.weight.data.clone()
+    codes, scales = quantize_embedding_int8(table)
+    rows = table.shape[0]  # padded to a multiple of 64
+    want_table = (codes.float().view(rows, 2, 128) * scales.float().unsqueeze(-1)).view(
+        rows, 256
+    )
+    assert (want_table - table.float()).abs().max() <= table.abs().max() / 127
+    make_embedding_int8(embed)
+    ids = torch.tensor([[0, 999, 5], [7, 7, 123]], device="cuda")
+    got = embed(ids)
+    assert got.shape == (2, 3, 256) and got.dtype == torch.bfloat16
+    torch.testing.assert_close(got.float(), want_table[ids].bfloat16().float())

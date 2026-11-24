@@ -77,6 +77,7 @@ from .ops import use_portable_kernels
 from .ops.allreduce import Inkling2AllReduceWorkspace
 from .ops.attention import compute_log_scaling_tau
 from .ops.attn_res import attn_res
+from .ops.embedding_int8 import embed_int8_enabled, make_embedding_int8
 from .ops.gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
 from .ops.gptq import COLLECTOR, collecting, collecting_layer_experts
 from .ops.int4_linear import int4_linear, is_packed_int4, pack_int4_rows
@@ -859,6 +860,8 @@ class Inkling2ForConditionalGeneration(
                 head.weight = nn.Parameter(pack(head.weight.data), requires_grad=False)
                 if bits == 8 and os.getenv("VLLM_INKLING2_MARLIN_W8_HEAD") == "1":
                     prepare_marlin_w8(head.weight, head.weight)
+        if embed_int8_enabled() and embed is not None and not tied:
+            make_embedding_int8(embed)
 
     def _reserve_expert_hessians(self) -> None:
         """Names the Humming experts of the collected layers (see
