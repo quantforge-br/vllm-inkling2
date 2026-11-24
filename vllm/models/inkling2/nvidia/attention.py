@@ -59,7 +59,7 @@ from .ops.attention import (
     plan_decode_attention,
     rel_decode_attention,
 )
-from .ops.attention_sm90 import MODE_OUT_LSE, rel_attention
+from .ops.attention_sm90 import MODE_OUT_LSE, plan_prefill_splits, rel_attention
 from .ops.gptq import (
     COLLECTOR,
     collect_full,
@@ -819,6 +819,14 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             cu_seqlens_q = cu_seqlens_q - num_decode_tokens
         key_cache, value_cache = self._split_kv_cache(kv_cache)
         if not use_sm100_kernels():
+            portable_splits = 1
+            if not self.is_local:
+                portable_splits = plan_prefill_splits(
+                    md.query_lens_cpu[num_decodes:],
+                    md.seq_lens_cpu[num_decodes:],
+                    self.num_heads,
+                    self.num_kv_heads,
+                )
             rel_attention(
                 q[:nt],
                 key_cache,
@@ -832,7 +840,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 max_query_len=md.max_query_len,
                 softmax_scale=self.scaling,
                 window=self.sliding_window if self.is_local else 0,
-                num_splits=1,
+                num_splits=portable_splits,
                 mode=MODE_OUT_LSE,
             )
             out[nt:].zero_()

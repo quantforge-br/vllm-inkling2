@@ -17,9 +17,11 @@ holds for every replay of a CUDA graph.
 import functools
 import os
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.platform_utils import num_compute_units
 
 # The query tile of tml_fa4 that shears the relative logits.
 _SHEAR_TILE = tl.constexpr(128)
@@ -76,6 +78,48 @@ def prefill_attn_pv_fp16_acc() -> bool:
 
 # Smallest query length whose int8 KV prefill takes the int8 QK^T path.
 PREFILL_ATTN_INT8_MIN_Q = 64
+
+
+@functools.cache
+def prefill_attn_splits_enabled() -> bool:
+    return os.getenv("VLLM_INKLING2_PREFILL_ATTN_SPLITS", "0") == "1"
+
+
+# Keys a program handles in the time of its fixed per-launch work, and the
+# key-equivalents of merging one split's fp32 partials, per query tile.
+_SPLIT_FIXED_KEYS = 256
+_SPLIT_MERGE_KEYS = 64
+
+
+def plan_prefill_splits(
+    query_lens: np.ndarray, seq_lens: np.ndarray, num_heads: int, num_kv_heads: int
+) -> int:
+    """KV splits of a full-layer prefill launch
+    (`VLLM_INKLING2_PREFILL_ATTN_SPLITS=1`, else 1).
+
+    One 128-row program fills an SM, so a long-context chunk of few query
+    tiles leaves its last wave mostly idle. Splitting each tile's keys `s`
+    ways trades that tail for merging `s` partials: pick the `s` (up to 8)
+    of the smallest estimated span (as `plan_attention`: the larger of the
+    wave-quantized longest programs and the total spread over the SMs), in
+    units of keys; within 2% of the best resolves to the fewest splits."""
+    if not prefill_attn_splits_enabled() or len(query_lens) == 0:
+        return 1
+    group = num_heads // num_kv_heads
+    tokens_per_tile = _block_m(int(query_lens.max()), group) // group
+    order = np.argsort(-seq_lens)
+    programs = (-(-query_lens[order] // tokens_per_tile) * num_kv_heads).astype(
+        np.float64
+    )
+    splits = np.arange(1, 9, dtype=np.float64)[:, None]
+    per_program = seq_lens[order] / splits + _SPLIT_FIXED_KEYS
+    waves = np.ceil(np.cumsum(programs * splits, axis=1) / num_compute_units())
+    span = np.maximum(
+        (waves * per_program).max(axis=1),
+        (programs * splits * per_program).sum(axis=1) / num_compute_units(),
+    )
+    cost = span + np.where(splits[:, 0] > 1, splits[:, 0] * _SPLIT_MERGE_KEYS, 0.0)
+    return int(np.argmax(cost <= 1.02 * cost.min())) + 1
 
 
 @triton.jit
@@ -395,6 +439,48 @@ def _rel_attention_kernel(
         tl.store(Out + part[:, None] * D + offs_d[None, :], o, mask=row_valid[:, None])
 
 
+@triton.jit
+def _merge_splits_kernel(
+    OPart,
+    LsePart,
+    Out,
+    Lse,
+    num_tokens,
+    stride_out_t,
+    stride_out_h,
+    stride_lse_h,
+    stride_lse_t,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    # `MODE_PARTIAL` split partials -> the `MODE_OUT_LSE` output and LSE.
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1)
+    splits = tl.arange(0, BLOCK_S)
+    offs_d = tl.arange(0, D)
+    part = (splits * num_tokens + token) * H + head
+    lse_s = tl.load(LsePart + part, mask=splits < NUM_SPLITS, other=float("-inf"))
+    lse_max = tl.max(lse_s)
+    lse_max = tl.where(lse_max == float("-inf"), 0.0, lse_max)
+    w = tl.exp2(lse_s - lse_max)
+    w_sum = tl.sum(w)
+    o_s = tl.load(
+        OPart + part[:, None] * D + offs_d[None, :],
+        mask=(w > 0.0)[:, None],
+        other=0.0,
+    )
+    o = tl.sum(o_s * (w / tl.where(w_sum == 0.0, 1.0, w_sum))[:, None], 0)
+    lse = tl.where(
+        w_sum == 0.0,
+        float("-inf"),
+        (tl.log2(tl.where(w_sum == 0.0, 1.0, w_sum)) + lse_max) * 0.6931471805599453,
+    )
+    tl.store(Out + token * stride_out_t + head * stride_out_h + offs_d, o)
+    tl.store(Lse + head * stride_lse_h + token * stride_lse_t, lse)
+
+
 def _block_m(max_query_len: int, group: int) -> int:
     rows = max_query_len * group
     return 16 if rows <= 16 else 32 if rows <= 32 else 64 if rows <= 64 else 128
@@ -428,9 +514,49 @@ def rel_attention(
     fp32 `out` `(T, H, D)` and natural-log `lse` `(H, T)`; `MODE_GATED`
     the bf16 `(T, H * D)` `out` (gated by `gate` and `sinks` unless
     drafting; a single split); `MODE_PARTIAL` the fp32 `out`
-    `(S, T, H, D)` and log2 `lse` `(S, T, H)` partials.
+    `(S, T, H, D)` and log2 `lse` `(S, T, H)` partials. `MODE_OUT_LSE`
+    with several splits merges their partials into `out` and `lse`.
     """
     num_tokens, num_heads, head_dim = q.shape
+    if mode == MODE_OUT_LSE and num_splits > 1:
+        assert lse is not None
+        o_part = q.new_empty((num_splits, *q.shape), dtype=torch.float32)
+        lse_part = q.new_empty((num_splits, num_tokens, num_heads), dtype=torch.float32)
+        rel_attention(
+            q,
+            key_cache,
+            value_cache,
+            o_part,
+            lse_part,
+            rel_logits,
+            gate,
+            sinks,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_query_len=max_query_len,
+            softmax_scale=softmax_scale,
+            window=window,
+            num_splits=num_splits,
+            mode=MODE_PARTIAL,
+        )
+        _merge_splits_kernel[(num_tokens, num_heads)](
+            o_part,
+            lse_part,
+            out,
+            lse,
+            num_tokens,
+            out.stride(0),
+            out.stride(1),
+            lse.stride(0),
+            lse.stride(1),
+            H=num_heads,
+            D=head_dim,
+            NUM_SPLITS=num_splits,
+            BLOCK_S=triton.next_power_of_2(num_splits),
+            num_warps=4,
+        )
+        return
     page, num_kv_heads = key_cache.shape[1:3]
     group = num_heads // num_kv_heads
     assert key_cache.stride() == value_cache.stride() and key_cache.stride(3) == 1
@@ -455,7 +581,7 @@ def rel_attention(
     tokens_per_tile = block_m // group
     int8_qk = (
         key_cache.dtype == torch.int8
-        and mode == MODE_OUT_LSE
+        and mode != MODE_GATED
         and max_query_len >= PREFILL_ATTN_INT8_MIN_Q
         and prefill_attn_int8()
     )

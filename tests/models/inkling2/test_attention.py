@@ -615,22 +615,18 @@ def test_sm86_full_attention_skips_old_int8_bias(monkeypatch, query_len, splits)
         _skip_old_bias.cache_clear()
 
 
-@pytest.mark.skipif(
+requires_sm86 = pytest.mark.skipif(
     _cap is None or (_cap.major, _cap.minor) != (8, 6),
     reason="Coverage for the SM86 int8 per-token-head prefill path",
 )
-@pytest.mark.parametrize("query_len,kv_len", [(300, 300), (64, 1500), (513, 2100)])
-@pytest.mark.parametrize("pv_fp16_acc", [False, True])
-@torch.inference_mode()
-def test_sm86_int8_qk_prefill_matches_bf16_qk(
-    monkeypatch, query_len, kv_len, pv_fp16_acc
-):
-    """INT8 QK^T (with the key-mean LSE correction) tracks the BF16 QK^T
-    prefill on int8 keys that share a channel offset."""
+
+
+def _sm86_int8_prefill(query_len, kv_len, heads=12, kv_heads=4, page=16, dim=128):
+    """Prefill inputs over an int8 per-token-head cache whose keys share a
+    channel offset, and a runner of `rel_attention` in `MODE_OUT_LSE`."""
     from vllm.models.inkling2.nvidia.ops import attention_sm90 as attn
 
     torch.manual_seed(7)
-    heads, kv_heads, page, dim = 12, 4, 16, 128
     pages = -(-kv_len // page)
     keys = torch.nn.functional.normalize(
         torch.randn(pages * page, kv_heads, dim, device="cuda"), dim=-1
@@ -654,13 +650,7 @@ def test_sm86_int8_qk_prefill_matches_bf16_qk(
     sheared = shear_rel_logits(rel, [(query_len, kv_len)], 128, False)
     table = torch.randperm(pages, device="cuda").view(1, -1).int()
 
-    def run(int8_qk):
-        monkeypatch.setenv("VLLM_INKLING2_PREFILL_ATTN_INT8", "1" if int8_qk else "0")
-        monkeypatch.setenv(
-            "VLLM_INKLING2_PREFILL_ATTN_PV_F16ACC", "1" if pv_fp16_acc else "0"
-        )
-        attn.prefill_attn_int8.cache_clear()
-        attn.prefill_attn_pv_fp16_acc.cache_clear()
+    def run(num_splits=1):
         out = torch.empty(q.shape, dtype=torch.float32, device="cuda")
         lse = torch.empty(heads, query_len, device="cuda")
         attn.rel_attention(
@@ -676,17 +666,48 @@ def test_sm86_int8_qk_prefill_matches_bf16_qk(
             max_query_len=query_len,
             softmax_scale=8 * dim**-0.5,
             window=0,
-            num_splits=1,
+            num_splits=num_splits,
             mode=attn.MODE_OUT_LSE,
         )
         return out, lse
 
-    try:
-        want_out, want_lse = run(False)
-        got_out, got_lse = run(True)
-    finally:
-        attn.prefill_attn_int8.cache_clear()
-        attn.prefill_attn_pv_fp16_acc.cache_clear()
+    return run
+
+
+def _set_prefill_flags(monkeypatch, int8_qk, pv_fp16_acc=False):
+    from vllm.models.inkling2.nvidia.ops import attention_sm90 as attn
+
+    monkeypatch.setenv("VLLM_INKLING2_PREFILL_ATTN_INT8", "1" if int8_qk else "0")
+    monkeypatch.setenv(
+        "VLLM_INKLING2_PREFILL_ATTN_PV_F16ACC", "1" if pv_fp16_acc else "0"
+    )
+    attn.prefill_attn_int8.cache_clear()
+    attn.prefill_attn_pv_fp16_acc.cache_clear()
+
+
+@pytest.fixture
+def clear_prefill_flags():
+    from vllm.models.inkling2.nvidia.ops import attention_sm90 as attn
+
+    yield
+    attn.prefill_attn_int8.cache_clear()
+    attn.prefill_attn_pv_fp16_acc.cache_clear()
+
+
+@requires_sm86
+@pytest.mark.parametrize("query_len,kv_len", [(300, 300), (64, 1500), (513, 2100)])
+@pytest.mark.parametrize("pv_fp16_acc", [False, True])
+@torch.inference_mode()
+def test_sm86_int8_qk_prefill_matches_bf16_qk(
+    monkeypatch, clear_prefill_flags, query_len, kv_len, pv_fp16_acc
+):
+    """INT8 QK^T (with the key-mean LSE correction) tracks the BF16 QK^T
+    prefill on int8 keys that share a channel offset."""
+    run = _sm86_int8_prefill(query_len, kv_len)
+    _set_prefill_flags(monkeypatch, False)
+    want_out, want_lse = run()
+    _set_prefill_flags(monkeypatch, True, pv_fp16_acc)
+    got_out, got_lse = run()
     cos = torch.nn.functional.cosine_similarity(
         got_out.flatten(1), want_out.flatten(1), dim=-1
     )
@@ -694,3 +715,38 @@ def test_sm86_int8_qk_prefill_matches_bf16_qk(
     assert not torch.equal(got_lse, want_lse)  # the int8 path ran
     torch.testing.assert_close(got_out, want_out, atol=3e-2, rtol=0)
     torch.testing.assert_close(got_lse, want_lse, atol=1e-2, rtol=0)
+
+
+@requires_sm86
+@pytest.mark.parametrize("num_splits", [2, 3, 5])
+@pytest.mark.parametrize("int8_qk", [False, True])
+@torch.inference_mode()
+def test_sm86_split_prefill_matches_single_split(
+    monkeypatch, clear_prefill_flags, num_splits, int8_qk
+):
+    """`MODE_OUT_LSE` over several KV splits merges to the one-split result."""
+    run = _sm86_int8_prefill(513, 4100)
+    _set_prefill_flags(monkeypatch, int8_qk)
+    want_out, want_lse = run()
+    got_out, got_lse = run(num_splits)
+    torch.testing.assert_close(got_out, want_out, atol=2e-3, rtol=0)
+    torch.testing.assert_close(got_lse, want_lse, atol=1e-5, rtol=1e-5)
+
+
+def test_plan_prefill_splits_fills_the_last_wave(monkeypatch):
+    import numpy as np
+
+    from vllm.models.inkling2.nvidia.ops import attention_sm90 as attn
+
+    monkeypatch.setattr(attn, "num_compute_units", lambda: 82)
+    attn.prefill_attn_splits_enabled.cache_clear()
+    try:
+        lens = np.array([2048])
+        assert attn.plan_prefill_splits(lens, lens + 245760, 12, 4) == 1
+        monkeypatch.setenv("VLLM_INKLING2_PREFILL_ATTN_SPLITS", "1")
+        attn.prefill_attn_splits_enabled.cache_clear()
+        # 49 tiles x 4 KV heads = 196 programs: 3 waves of 82 at one split.
+        splits = attn.plan_prefill_splits(lens, lens + 245760, 12, 4)
+        assert splits > 1 and 196 * splits / 82 % 1 > 0.9
+    finally:
+        attn.prefill_attn_splits_enabled.cache_clear()
