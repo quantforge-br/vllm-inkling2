@@ -136,7 +136,6 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
                 prefix_len = prefix_len + (prefix_prob >= self.min_prefix_confidence)
             elif self.draft_logits is None:
                 prev = self.model.markov_argmax(base_logits[:, i], bias)
-                prev = self.model.map_draft_to_target(prev)
             else:
                 logits = self.model.markov_logits(base_logits[:, i], bias)
                 prev = self._sample_logits(logits, idx_map[:, i], sample_pos[:, i], i)
