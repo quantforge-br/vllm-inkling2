@@ -38,7 +38,7 @@ def _p2p_draft_norm_kernel(
     mine = tl.where(mine == 0.0, 0.0, mine)
     tl.store(peer + base + row, mine.to(tl.bfloat16), mask)
     pending = 1
-    while pending:
+    while pending != 0:
         landed = tl.load(recv + base + row, mask, other=0, volatile=True)
         pending = tl.sum((landed.to(tl.int16, bitcast=True) == -32768).to(tl.int32))
     other = tl.load(recv + base + row, mask, other=0, volatile=True).to(tl.float32)
