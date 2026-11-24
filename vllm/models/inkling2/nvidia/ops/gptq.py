@@ -306,6 +306,99 @@ def gptq_w4_asym(
     return codes, scales.bfloat16(), zeros.to(torch.int32)
 
 
+# Scale candidates of the symmetric search: `amax / divisor * shrink`. The
+# divisor 8 puts a negative extreme on code -8, 7 a positive one on +7.
+_SYM_DIVISORS = (7.0, 7.5, 8.0)
+_SYM_SHRINKS = (1.0, 0.97, 0.94, 0.91, 0.88, 0.85, 0.82)
+
+
+def _sym_scales(group: torch.Tensor, importance: torch.Tensor) -> torch.Tensor:
+    """bf16-rounded symmetric scales `[..., N]` of `group` `[..., N, GROUP]`
+    minimizing the `importance`-weighted (`[..., GROUP]`, e.g. the Hessian
+    diagonal) squared rounding error over a small grid."""
+    amax = group.abs().amax(dim=-1).clamp(min=1e-8)
+    weights = importance.unsqueeze(-2)
+    best = best_err = None
+    for divisor in _SYM_DIVISORS:
+        for shrink in _SYM_SHRINKS:
+            scale = (amax * (shrink / divisor)).bfloat16().float().clamp(min=1e-8)
+            q = torch.clamp(torch.round(group / scale.unsqueeze(-1)), -8, 7)
+            err = ((group - q * scale.unsqueeze(-1)).square() * weights).sum(-1)
+            if best is None:
+                best, best_err = scale, err
+            else:
+                better = err < best_err
+                best = torch.where(better, scale, best)
+                best_err = torch.where(better, err, best_err)
+    assert best is not None
+    return best
+
+
+def prepare_hessian(
+    hessian: torch.Tensor, damp: float = _DAMP
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Damped inverse-Hessian Cholesky factors `[..., K, K]` (upper), the
+    damped diagonal `[..., K]` and the dead-input mask `[..., K]`."""
+    h = hessian.float().clone()
+    diag = torch.diagonal(h, dim1=-2, dim2=-1)
+    dead = diag == 0
+    diag.masked_fill_(dead, 1.0)
+    diag.add_(damp * diag.mean(dim=-1, keepdim=True))
+    hinv = torch.linalg.cholesky(
+        torch.cholesky_inverse(torch.linalg.cholesky(h)), upper=True
+    )
+    return hinv, diag.clone(), dead
+
+
+@torch.no_grad()
+def gptq_w4_sym(
+    weight: torch.Tensor, hessian: torch.Tensor, damp: float = _DAMP
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric (`uint4b8`) GPTQ of `weight` `[..., N, K]` for the input
+    Hessians `hessian` `[..., K, K]` (leading dims batch independent
+    matrices): codes `[..., N, K]` (`q + 8`, 0..15) and positive bf16 scales
+    `[..., N, K / GROUP]`, with `w ~= (code - 8) * scale`. Groups of 128
+    input columns, no activation reordering; each group's scale is searched
+    on its error-updated weights."""
+    squeeze = weight.dim() == 2
+    if squeeze:
+        weight, hessian = weight.unsqueeze(0), hessian.unsqueeze(0)
+    b, n, k = weight.shape
+    assert k % GROUP == 0 and _BLOCK == GROUP
+    w = weight.float().clone()
+    hinv, diag, dead = prepare_hessian(hessian.to(w.device), damp)
+    w.masked_fill_(dead.unsqueeze(1), 0.0)
+    codes = torch.empty((b, n, k), dtype=torch.uint8, device=w.device)
+    scales = torch.empty((b, n, k // GROUP), dtype=torch.float32, device=w.device)
+    for i1 in range(0, k, _BLOCK):
+        i2 = i1 + _BLOCK
+        g = i1 // GROUP
+        w1 = w[:, :, i1:i2].clone()
+        err1 = torch.zeros_like(w1)
+        hinv1 = hinv[:, i1:i2, i1:i2]
+        scale = _sym_scales(w1, diag[:, i1:i2])
+        scales[:, :, g] = scale
+        for i in range(_BLOCK):
+            q = torch.clamp(torch.round(w1[:, :, i] / scale), -8, 7)
+            codes[:, :, i1 + i] = (q + 8).to(torch.uint8)
+            err = (w1[:, :, i] - q * scale) / hinv1[:, i, i].unsqueeze(1)
+            w1[:, :, i:] -= err.unsqueeze(2) * hinv1[:, i, i:].unsqueeze(1)
+            err1[:, :, i] = err
+        if i2 < k:
+            w[:, :, i2:] -= torch.bmm(err1, hinv[:, i1:i2, i2:])
+    out = codes, scales.bfloat16()
+    if squeeze:
+        return out[0][0], out[1][0]
+    return out
+
+
+def dequantize_w4_sym(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """The fp32 `[..., N, K]` weight of `gptq_w4_sym` codes and scales."""
+    *lead, n, k = codes.shape
+    w = codes.float().view(*lead, n, k // GROUP, GROUP) - 8
+    return (w * scales.float().unsqueeze(-1)).view(*lead, n, k)
+
+
 def quantize_projection(
     name: str, weight: torch.Tensor, row_blocks: list[tuple[str, int]]
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
